@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# HelpCode 配置（含密钥，不入库）
+.helpcode/config.yaml
+
+# 归档的旧版本
+_archive_v1_tools/
+
+# 编辑器
+.idea/
+.vscode/

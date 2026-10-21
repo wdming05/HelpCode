@@ -1,0 +1,24 @@
+# HelpCode 配置模板
+# 使用方法：复制本文件为 .helpcode/config.yaml，并填入真实值。
+# .helpcode/config.yaml 含真实密钥，切勿提交到版本库。
+#
+# 重要：protocol 的选择 ——
+#   - qwen / 百炼 / DeepSeek 等「OpenAI 兼容」服务 → 用 openai
+#   - Anthropic 官方 Claude → 用 anthropic
+
+providers:
+  # ── 示例 1：OpenAI 协议（qwen / 百炼 / DeepSeek 等兼容服务）──
+  - name: "qwen"
+    protocol: openai
+    api_key: "sk-..."                                  # 你的 API Key
+    model: "qwen3.7-max"                               # 模型名
+    base_url: "https://.../compatible-mode/v1"         # 兼容端点；官方 OpenAI 填 null
+    thinking: false                                    # openai 协议下此字段不生效
+
+  # ── 示例 2：Anthropic 协议（官方 Claude，按需取消注释）──
+  # - name: "Claude"
+  #   protocol: anthropic
+  #   api_key: "sk-ant-..."
+  #   model: "claude-sonnet-4-5"
+  #   base_url: null
+  #   thinking: true
