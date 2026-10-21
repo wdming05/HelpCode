@@ -1,10 +1,11 @@
 """会话模块：进程内维护单会话多轮历史。"""
 
-from .llm import Message
+from .llm import Message, ToolCall
+from .tool import ToolResult
 
 
 class Conversation:
-    """单会话多轮历史（user/assistant 交替）。"""
+    """单会话多轮历史（user/assistant/tool 交替）。"""
 
     def __init__(self) -> None:
         self._messages: list[Message] = []
@@ -14,6 +15,23 @@ class Conversation:
 
     def add_assistant(self, text: str) -> None:
         self._messages.append(Message(role="assistant", content=text))
+
+    def add_assistant_tool_calls(self, tool_calls: list[ToolCall]) -> None:
+        """追加一条 assistant 请求工具的消息。"""
+        self._messages.append(
+            Message(role="assistant", content="", tool_calls=tool_calls)
+        )
+
+    def add_tool_result(self, tool_call_id: str, result: ToolResult) -> None:
+        """追加一条工具结果消息（role=tool）。"""
+        self._messages.append(
+            Message(
+                role="tool",
+                content=result.content,
+                tool_call_id=tool_call_id,
+                tool_results=[result],
+            )
+        )
 
     def messages(self) -> list[Message]:
         """返回消息副本，避免外部直接修改内部状态。"""

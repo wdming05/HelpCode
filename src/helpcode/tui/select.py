@@ -29,5 +29,6 @@ class SelectMixin:
         """用户选定一个 provider 后进入对话。"""
         cfg = self.providers[event.option_index]
         self.provider = new_provider(cfg)
+        self._setup_agent()
         self._update_statusbar()
         self._exit_selecting()

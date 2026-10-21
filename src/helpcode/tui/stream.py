@@ -6,22 +6,25 @@ import time
 from textual.widgets import RichLog, Static
 
 from . import SessionState
-from .view import error_block, render_markdown
+from .view import error_block, render_markdown, render_tool_line
 
 
 class StreamMixin:
     """流式接入与计时的方法集合，混入 HelpCodeApp。"""
 
-    async def _consume_stream(self) -> None:
-        """消费 provider 流事件，逐字更新动态区。"""
+    async def _consume_stream(self, text: str) -> None:
+        """消费 Agent 事件：文本流式 + 工具行 + 收尾。"""
         try:
-            async for ev in self.provider.stream(self.conv.messages()):
+            async for ev in self.agent.run(text):
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
                     return
                 if ev.text:
                     self.cur_reply += ev.text
                     self._refresh_streaming_view()
+                if ev.tool_call is not None and ev.tool_result is not None:
+                    log = self.query_one("#log", RichLog)
+                    log.write(render_tool_line(ev.tool_call, ev.tool_result))
                 if ev.done:
                     self._finish_with_assistant(self.cur_reply)
                     return
@@ -49,7 +52,6 @@ class StreamMixin:
         log = self.query_one("#log", RichLog)
         log.write(render_markdown(reply))
         log.write(f"（耗时 {elapsed:.1f}s）")
-        self.conv.add_assistant(reply)
         self._stop_stream()
 
     def _finish_with_error(self, err: Exception) -> None:

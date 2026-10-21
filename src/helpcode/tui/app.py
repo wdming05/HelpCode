@@ -9,10 +9,11 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .. import __version__
+from ..agent import Agent
 from ..config import ProviderConfig
-from ..conversation import Conversation
 from ..llm import Provider, new_provider
 from ..prompt import render_banner
+from ..tool import new_default_registry
 from . import SessionState
 from .select import SelectMixin
 from .stream import StreamMixin
@@ -36,8 +37,8 @@ class InputArea(TextArea):
             self.action_submit_input()
             return
         if key == "alt+enter":
-            event.stop()#停止事件冒泡，不要让父组件也处理这个按键。
-            event.prevent_default()#阻止默认行为，即不让 TextArea 在光标处插入换行。
+            event.stop()  # 停止事件冒泡，不要让父组件也处理这个按键。
+            event.prevent_default()  # 阻止默认行为，即不让 TextArea 在光标处插入换行。
             start, end = self.selection
             self._replace_via_keyboard("\n", start, end)
             return
@@ -83,7 +84,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self.providers = providers
         self.state = SessionState.SELECTING
         self.provider: Provider | None = None
-        self.conv = Conversation()
+        self.agent: Agent | None = None
         self.cur_reply = ""
         self.turn_start = 0.0
         self._stream_task = None
@@ -107,6 +108,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
 
         if len(self.providers) == 1:
             self.provider = new_provider(self.providers[0])
+            self._setup_agent()
             self.state = SessionState.IDLE
             self._update_statusbar()
         else:
@@ -123,6 +125,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
             render_statusbar(self.provider.name, self.provider.model)
         )
 
+    def _setup_agent(self) -> None:
+        """provider 确定后，构造 Agent（持有会话与工具注册中心）。"""
+        self.agent = Agent(self.provider, new_default_registry())
+
     async def submit(self, text: str) -> None:
         """处理一次输入提交。"""
         if self.state != SessionState.IDLE:
@@ -134,14 +140,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
             await self.action_quit()
             return
 
-        self.conv.add_user(text)
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
         self.query_one("#input", InputArea).clear()
         self.cur_reply = ""
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_stream(text))
         self._timer = self.set_interval(0.1, self._tick)
 
     async def action_quit(self) -> None:
