@@ -6,7 +6,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from ..llm import ToolCall
+from ..llm import TokenUsage, ToolCall
 from ..tool import ToolResult
 
 
@@ -44,12 +44,33 @@ def _summarize_args(input: dict, limit: int = 40) -> str:
     return s if len(s) <= limit else s[:limit] + "…"
 
 
-def render_tool_line(tool_call: ToolCall, tool_result: ToolResult) -> Text:
-    """工具行：● 工具名(关键参数) + 结果摘要；失败红色、过长截断。"""
+def render_tool_start(tool_call: ToolCall) -> Text:
+    """工具调用开始：● 工具名(关键参数)。"""
     args = _summarize_args(tool_call.input)
-    head = Text(f"● {tool_call.name}({args})", style="bold cyan")
+    return Text(f"● {tool_call.name}({args})", style="bold cyan")
+
+
+def render_tool_end(tool_call: ToolCall, tool_result: ToolResult) -> Text:
+    """工具调用结束：结果摘要；失败红色、过长截断。"""
     summary = tool_result.content
     if len(summary) > 120:
         summary = summary[:120] + "…"
-    body = Text(summary, style="" if tool_result.ok else "red")
-    return Text.assemble(head, "\n", body)
+    return Text(summary, style="" if tool_result.ok else "red")
+
+
+def render_token_usage(usage: TokenUsage) -> Text:
+    """Token 用量展示（一轮结束定型时入对话区）。"""
+    return Text(
+        f"（{usage.input_tokens} 输入 / {usage.output_tokens} 输出 tokens）",
+        style="dim",
+    )
+
+
+def render_iteration(n: int) -> Text:
+    """迭代轮次展示（流式态动态区）。"""
+    return Text(f"第 {n}/25 轮", style="bold")
+
+
+def render_notice(text: str) -> Text:
+    """停止提示块（黄色，区别于错误红色）。"""
+    return Text("● " + text, style="bold yellow")

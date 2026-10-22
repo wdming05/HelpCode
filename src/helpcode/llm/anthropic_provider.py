@@ -8,7 +8,7 @@ from anthropic import AsyncAnthropic
 
 from ..config import ProviderConfig
 from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, ToolCall
+from . import Message, StreamEvent, TokenUsage, ToolCall
 
 
 def _to_anthropic_messages(msgs: list[Message]) -> list[dict]:
@@ -84,13 +84,16 @@ class AnthropicProvider:
         return self._model
 
     async def stream(
-        self, msgs: list[Message], tools: list[dict] | None = None
+        self,
+        msgs: list[Message],
+        tools: list[dict] | None = None,
+        system_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，yield 文本增量与工具调用；思考增量内部丢弃。"""
         params = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT,
+            "system": SYSTEM_PROMPT + (system_suffix or ""),
             "messages": _to_anthropic_messages(msgs),
         }
         if tools:
@@ -103,6 +106,7 @@ class AnthropicProvider:
                 tool_calls: list[ToolCall] = []
                 current: dict | None = None  # 当前 tool_use 的 {"id","name"}
                 json_buffer = ""
+                usage: TokenUsage | None = None
 
                 async for event in stream:
                     if event.type == "content_block_start":
@@ -131,7 +135,14 @@ class AnthropicProvider:
                         )
                         current = None
                         json_buffer = ""
+                    elif event.type == "message_delta" and event.usage:
+                        usage = TokenUsage(
+                            input_tokens=event.usage.input_tokens or 0,
+                            output_tokens=event.usage.output_tokens or 0,
+                        )
 
+                if usage is not None:
+                    yield StreamEvent(usage=usage)  # 独立事件，done 之前
                 yield StreamEvent(done=True, tool_calls=tool_calls or None)
         except asyncio.CancelledError:
             raise

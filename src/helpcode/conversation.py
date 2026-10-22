@@ -36,3 +36,7 @@ class Conversation:
     def messages(self) -> list[Message]:
         """返回消息副本，避免外部直接修改内部状态。"""
         return list(self._messages)
+
+    def last_role(self) -> str | None:
+        """返回历史最后一条消息的角色；空历史返回 None。"""
+        return self._messages[-1].role if self._messages else None

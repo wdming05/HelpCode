@@ -9,10 +9,11 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .. import __version__
-from ..agent import Agent
+from ..agent import Agent, Mode
 from ..config import ProviderConfig
+from ..conversation import Conversation
 from ..llm import Provider, new_provider
-from ..prompt import render_banner
+from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import new_default_registry
 from . import SessionState
 from .select import SelectMixin
@@ -77,7 +78,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
     }
     """
 
-    BINDINGS = [("ctrl+c", "quit", "退出")]
+    BINDINGS = [
+        ("ctrl+c", "quit", "退出"),
+        ("escape", "cancel", "取消"),
+    ]
 
     def __init__(self, providers: list[ProviderConfig]) -> None:
         super().__init__()
@@ -85,7 +89,11 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self.state = SessionState.SELECTING
         self.provider: Provider | None = None
         self.agent: Agent | None = None
+        self.conv = Conversation()
+        self.cancel_event = asyncio.Event()
+        self.mode = Mode.NORMAL
         self.cur_reply = ""
+        self._cur_iteration = 0
         self.turn_start = 0.0
         self._stream_task = None
         self._timer = None
@@ -139,18 +147,35 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         if text == "/exit":
             await self.action_quit()
             return
+        if text == "/plan":
+            self.mode = Mode.PLAN
+            log = self.query_one("#log", RichLog)
+            log.write(user_block("/plan"))
+            log.write("已进入计划模式（仅只读工具，可 /do 切换回执行）")
+            return
+        if text == "/do":
+            self.mode = Mode.NORMAL
+            text = EXECUTE_DIRECTIVE  # 注入执行指令，触发模型按计划执行
 
+        self.cancel_event = asyncio.Event()  # 每次提交重置取消信号
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
         self.query_one("#input", InputArea).clear()
         self.cur_reply = ""
+        self._cur_iteration = 0
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
         self._stream_task = asyncio.create_task(self._consume_stream(text))
         self._timer = self.set_interval(0.1, self._tick)
 
+    async def action_cancel(self) -> None:
+        """Esc：流式态取消当前循环（协作式，不退出程序）。"""
+        if self.state == SessionState.STREAMING:
+            self.cancel_event.set()
+
     async def action_quit(self) -> None:
-        """安全退出：取消进行中的流，恢复终端。"""
-        if self._stream_task is not None:
-            self._stream_task.cancel()
-        self.exit()
+        """Ctrl+C：流式态取消、空闲态退出。"""
+        if self.state == SessionState.STREAMING:
+            self.cancel_event.set()
+        else:
+            self.exit()

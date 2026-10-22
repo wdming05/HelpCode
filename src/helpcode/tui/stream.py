@@ -6,27 +6,47 @@ import time
 from textual.widgets import RichLog, Static
 
 from . import SessionState
-from .view import error_block, render_markdown, render_tool_line
+from .view import (
+    error_block,
+    render_markdown,
+    render_notice,
+    render_token_usage,
+    render_tool_end,
+    render_tool_start,
+)
 
 
 class StreamMixin:
     """流式接入与计时的方法集合，混入 HelpCodeApp。"""
 
     async def _consume_stream(self, text: str) -> None:
-        """消费 Agent 事件：文本流式 + 工具行 + 收尾。"""
+        """消费 Agent 事件：文本流式 + 工具行 + 轮次 + 收尾。"""
+        usage = None
         try:
-            async for ev in self.agent.run(text):
+            async for ev in self.agent.run(
+                text, self.conv, self.cancel_event, self.mode
+            ):
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
                     return
+                if ev.iteration is not None:
+                    self._cur_iteration = ev.iteration
                 if ev.text:
                     self.cur_reply += ev.text
                     self._refresh_streaming_view()
-                if ev.tool_call is not None and ev.tool_result is not None:
+                if ev.tool_start is not None:
                     log = self.query_one("#log", RichLog)
-                    log.write(render_tool_line(ev.tool_call, ev.tool_result))
+                    log.write(render_tool_start(ev.tool_start))
+                if ev.tool_end is not None:
+                    log = self.query_one("#log", RichLog)
+                    log.write(render_tool_end(ev.tool_call, ev.tool_end))
+                if ev.token_usage is not None:
+                    usage = ev.token_usage
+                if ev.notice is not None:
+                    log = self.query_one("#log", RichLog)
+                    log.write(render_notice(ev.notice))
                 if ev.done:
-                    self._finish_with_assistant(self.cur_reply)
+                    self._finish_with_assistant(self.cur_reply, usage)
                     return
         except asyncio.CancelledError:
             raise
@@ -34,23 +54,27 @@ class StreamMixin:
             self._finish_with_error(e)
 
     def _tick(self) -> None:
-        """计时刷新（0.1s 一次），仅流式期间更新。"""
+        """计时刷新（0.1s 一次），仅流式期间更新；含迭代轮次。"""
         if self.state != SessionState.STREAMING:
             return
         elapsed = int(time.monotonic() - self.turn_start)
+        iteration = getattr(self, "_cur_iteration", 0)
+        suffix = f" · 第 {iteration}/25 轮" if iteration else ""
         self.query_one("#streaming", Static).update(
-            f"● {self.cur_reply}\n\nImagining… ({elapsed}s)"
+            f"● {self.cur_reply}\n\nImagining… ({elapsed}s){suffix}"
         )
 
     def _refresh_streaming_view(self) -> None:
         """流式期间实时显示已收文本。"""
         self.query_one("#streaming", Static).update(f"● {self.cur_reply}")
 
-    def _finish_with_assistant(self, reply: str) -> None:
-        """done：markdown 定型追加到 RichLog，记录耗时，回 IDLE。"""
+    def _finish_with_assistant(self, reply: str, usage=None) -> None:
+        """done：markdown 定型 + Token 用量入 RichLog，回 IDLE。"""
         elapsed = time.monotonic() - self.turn_start
         log = self.query_one("#log", RichLog)
         log.write(render_markdown(reply))
+        if usage is not None:
+            log.write(render_token_usage(usage))
         log.write(f"（耗时 {elapsed:.1f}s）")
         self._stop_stream()
 
@@ -67,5 +91,6 @@ class StreamMixin:
             self._timer = None
         self._stream_task = None
         self.cur_reply = ""
+        self._cur_iteration = 0
         self.query_one("#streaming", Static).update("")
         self.state = SessionState.IDLE

@@ -9,6 +9,14 @@ from ..tool import ToolResult
 
 
 @dataclass
+class TokenUsage:
+    """一轮对话的 Token 用量。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class ToolCall:
     """模型发起的一次工具调用请求。"""
 
@@ -32,6 +40,7 @@ class Message:
 class StreamEvent:
     text: str = ""  # 文本增量
     tool_calls: list[ToolCall] | None = None  # done 时带出本轮全部工具调用
+    usage: TokenUsage | None = None  # 独立事件：done 之前单独 yield
     done: bool = False  # 本轮正常结束
     err: Exception | None = None  # 出错（与 done 互斥）
 
@@ -46,8 +55,12 @@ class Provider(Protocol):
     def model(self) -> str: ...
 
     # tools 为 Registry.export() 的统一格式，各适配器内部转成本协议格式
+    # system_suffix：追加到 system prompt 尾部（Plan Mode 提示词）
     def stream(
-        self, msgs: list[Message], tools: list[dict] | None = None
+        self,
+        msgs: list[Message],
+        tools: list[dict] | None = None,
+        system_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]: ...
 
 

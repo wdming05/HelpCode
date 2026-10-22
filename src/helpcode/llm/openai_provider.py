@@ -8,12 +8,15 @@ from openai import AsyncOpenAI
 
 from ..config import ProviderConfig
 from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, ToolCall
+from . import Message, StreamEvent, TokenUsage, ToolCall
 
 
-def _to_openai_messages(msgs: list[Message]) -> list[dict]:
+def _to_openai_messages(
+    msgs: list[Message], system_suffix: str | None = None
+) -> list[dict]:
     """把内部 Message 转成 openai 的 messages 格式（首条为 system）。"""
-    result = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_content = SYSTEM_PROMPT + (system_suffix or "")
+    result = [{"role": "system", "content": system_content}]
     for m in msgs:
         if m.role == "tool":
             result.append(
@@ -78,13 +81,17 @@ class OpenAIProvider:
         return self._model
 
     async def stream(
-        self, msgs: list[Message], tools: list[dict] | None = None
+        self,
+        msgs: list[Message],
+        tools: list[dict] | None = None,
+        system_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，yield 文本增量与工具调用。thinking 字段忽略。"""
         kwargs = {
             "model": self._model,
-            "messages": _to_openai_messages(msgs),
+            "messages": _to_openai_messages(msgs, system_suffix),
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = _to_openai_tools(tools)
@@ -94,8 +101,14 @@ class OpenAIProvider:
 
             # 按 index 累积分片的工具调用
             tool_calls_map: dict[int, dict] = {}
+            usage: TokenUsage | None = None
 
             async for chunk in stream:
+                if chunk.usage:
+                    usage = TokenUsage(
+                        input_tokens=chunk.usage.prompt_tokens or 0,
+                        output_tokens=chunk.usage.completion_tokens or 0,
+                    )
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -124,6 +137,8 @@ class OpenAIProvider:
                     ToolCall(id=entry["id"], name=entry["name"], input=input_obj)
                 )
 
+            if usage is not None:
+                yield StreamEvent(usage=usage)  # 独立事件，done 之前
             yield StreamEvent(done=True, tool_calls=tool_calls or None)
         except asyncio.CancelledError:
             raise
