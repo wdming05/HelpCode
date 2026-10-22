@@ -1,0 +1,235 @@
+"""Agent Loop：多轮循环，自主调用工具直到满足停止条件。"""
+
+import asyncio
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from enum import Enum
+
+from . import prompt
+from .conversation import Conversation
+from .llm import Provider, Request, System, TokenUsage, ToolCall
+from .tool import Registry, ToolResult
+
+
+class Mode(Enum):
+    """会话模式。"""
+
+    NORMAL = "normal"
+    PLAN = "plan"
+
+
+@dataclass
+class AgentEvent:
+    """Agent 发给上层（TUI）的事件。"""
+
+    text: str = ""  # 文本增量（流式）
+    tool_start: ToolCall | None = None  # 工具调用开始（工具名 + 参数）
+    tool_end: ToolResult | None = None  # 工具调用结束（结果摘要 + 是否错误）
+    tool_call: ToolCall | None = None  # tool_end 对应的调用（配对）
+    token_usage: TokenUsage | None = None  # 一轮结束时的用量
+    iteration: int | None = None  # 当前迭代轮次（进度）
+    notice: str | None = None  # 停止提示（非错误）
+    done: bool = False  # 本轮（一次 run）结束
+    err: Exception | None = None  # LLM 流出错
+
+
+class Agent:
+    """多轮循环：输入 → 流式 → 执行工具 → 回灌 → 循环，直到停止条件。"""
+
+    MAX_ITERATIONS = 25
+    MAX_UNKNOWN_RUN = 3
+    BATCH_TIMEOUT = 30.0
+    PLAN_REMINDER_INTERVAL = 4
+
+    def __init__(
+        self, provider: Provider, registry: Registry, version: str = "dev"
+    ) -> None:
+        self.provider = provider
+        self.registry = registry
+        self._version = version
+
+    async def run(
+        self,
+        user_input: str,
+        conv: Conversation,
+        cancel_event: asyncio.Event,
+        mode: Mode = Mode.NORMAL,
+    ) -> AsyncIterator[AgentEvent]:
+        conv.add_user(user_input)
+        unknown_run = 0
+
+        # ch05：采集环境 + 装配稳定 system（一次，循环外）
+        env = await prompt.gather_environment(self._version, self.provider.model)
+        sys = prompt.build_system_prompt()
+        env_text = env.render()
+
+        for iteration in range(1, self.MAX_ITERATIONS + 1):
+            # 终止优先级：取消最高（协作式，每轮开头检查）
+            if cancel_event.is_set():
+                yield AgentEvent(notice="已取消")
+                self._finish_cancelled(conv)
+                yield AgentEvent(done=True)
+                return
+
+            yield AgentEvent(iteration=iteration)
+
+            # 按模式选工具与提醒
+            if mode is Mode.PLAN:
+                tools = self.registry.read_only_definitions()
+                full = (iteration == 1) or (
+                    (iteration - 1) % self.PLAN_REMINDER_INTERVAL == 0
+                )
+                reminder = prompt.plan_reminder(full)
+            else:
+                tools = self.registry.export()
+                reminder = ""
+
+            # 流式收集：双路（实时 yield + 累积完整文本）
+            out: dict = {}
+            async for ev in self._stream_once(
+                conv, sys, env_text, tools, reminder, out
+            ):
+                if ev.err is not None:
+                    yield ev
+                    return
+                yield ev
+            text = out.get("text", "")
+            tool_calls = out.get("tool_calls")
+            usage = out.get("usage")
+
+            # 正常完成：纯文本（无工具），或混合（文本 + 工具）时丢弃工具
+            if not tool_calls or text:
+                conv.add_assistant(text)
+                if usage is not None:
+                    yield AgentEvent(token_usage=usage)
+                yield AgentEvent(done=True)
+                return
+
+            # 纯工具调用：记历史
+            conv.add_assistant_tool_calls(tool_calls)
+
+            # 未知工具检测：该轮所有调用都未知 → streak+1，否则清零
+            if all(self.registry.get(c.name) is None for c in tool_calls):
+                unknown_run += 1
+            else:
+                unknown_run = 0
+            if unknown_run >= self.MAX_UNKNOWN_RUN:
+                yield AgentEvent(notice="连续请求未知工具，已停止")
+                self._ensure_assistant_tail(conv, "连续请求未知工具，已停止")
+                yield AgentEvent(done=True)
+                return
+
+            # 执行（并发/串行），结果按原始顺序回灌
+            results = await self._execute_calls(tool_calls)
+            for call in tool_calls:
+                yield AgentEvent(tool_start=call)
+            for call, result in zip(tool_calls, results):
+                yield AgentEvent(tool_end=result, tool_call=call)
+                conv.add_tool_result(call.id, result)
+
+        # 迭代上限
+        yield AgentEvent(notice="已达到最大迭代次数")
+        self._ensure_assistant_tail(conv, "已达到最大迭代次数")
+        yield AgentEvent(done=True)
+
+    async def _stream_once(
+        self,
+        conv: Conversation,
+        sys: str,
+        env_text: str,
+        tools: list[dict] | None,
+        reminder: str,
+        out: dict,
+    ) -> AsyncIterator[AgentEvent]:
+        """组装 Request 并消费一轮流；yield 事件，收集结果写入 out。"""
+        req = Request(
+            messages=conv.messages(),
+            tools=tools,
+            system=System(stable=sys, environment=env_text),
+            reminder=reminder,
+        )
+        text = ""
+        tool_calls = None
+        usage = None
+        async for ev in self.provider.stream(req):
+            if ev.err is not None:
+                yield AgentEvent(err=ev.err)
+                return
+            if ev.text:
+                text += ev.text
+                yield AgentEvent(text=ev.text)
+            if ev.usage:
+                usage = ev.usage
+            if ev.done:
+                tool_calls = ev.tool_calls
+                break
+        out["text"] = text
+        out["tool_calls"] = tool_calls
+        out["usage"] = usage
+
+    async def _execute_calls(self, calls: list[ToolCall]) -> list[ToolResult]:
+        """并发/串行调度：连续只读并发、副作用串行，结果按原始下标。"""
+        results: list[ToolResult] = [
+            ToolResult(ok=False, content="(未执行)") for _ in calls
+        ]
+        i = 0
+        while i < len(calls):
+            name = calls[i].name
+            if self.registry.get(name) is None:
+                results[i] = ToolResult(ok=False, content=f"错误：未知工具 {name}")
+                i += 1
+                continue
+
+            if self.registry.is_read_only(name):
+                # 收集连续只读段
+                batch = [i]
+                j = i + 1
+                while j < len(calls) and self.registry.is_read_only(calls[j].name):
+                    batch.append(j)
+                    j += 1
+                # 并发执行整个批（整体超时，避免卡死）
+                try:
+                    batch_results = await asyncio.wait_for(
+                        asyncio.gather(*[self._execute_one(calls[k]) for k in batch]),
+                        timeout=self.BATCH_TIMEOUT,
+                    )
+                except TimeoutError:
+                    batch_results = [
+                        ToolResult(
+                            ok=False,
+                            content=f"错误：工具批执行超时（>{self.BATCH_TIMEOUT}s）",
+                        )
+                        for _ in batch
+                    ]
+                for k, r in zip(batch, batch_results):
+                    results[k] = r
+                i = j
+            else:
+                # 副作用调用：串行
+                results[i] = await self._execute_one(calls[i])
+                i += 1
+        return results
+
+    async def _execute_one(self, call: ToolCall) -> ToolResult:
+        """执行一个工具调用；未知工具/异常均包成 ToolResult。"""
+        tool = self.registry.get(call.name)
+        if tool is None:
+            return ToolResult(ok=False, content=f"错误：未知工具 {call.name}")
+        try:
+            # 同步工具函数放到线程执行，避免阻塞事件循环
+            return await asyncio.to_thread(tool.run, **call.input)
+        except Exception as e:
+            return ToolResult(ok=False, content=f"错误：工具执行失败 {e}")
+
+    def _ensure_assistant_tail(self, conv: Conversation, text: str) -> None:
+        """确保历史以 assistant 消息结尾（终止时的统一收尾，防 400）。"""
+        if conv.last_role() != "assistant":
+            conv.add_assistant(text)
+
+    def _finish_cancelled(self, conv: Conversation) -> None:
+        """取消收尾：为「已发起但未回灌」的工具调用补「已取消」，保证配对合法。"""
+        msgs = conv.messages()
+        if msgs and msgs[-1].role == "assistant" and msgs[-1].tool_calls:
+            for tc in msgs[-1].tool_calls:
+                conv.add_tool_result(tc.id, ToolResult(ok=False, content="已取消"))
+        self._ensure_assistant_tail(conv, "已取消")

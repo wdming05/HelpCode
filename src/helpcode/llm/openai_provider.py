@@ -7,17 +7,16 @@ from collections.abc import AsyncIterator
 from openai import AsyncOpenAI
 
 from ..config import ProviderConfig
-from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, TokenUsage, ToolCall
+from . import Request, StreamEvent, TokenUsage, ToolCall
 
 
-def _to_openai_messages(
-    msgs: list[Message], system_suffix: str | None = None
-) -> list[dict]:
-    """把内部 Message 转成 openai 的 messages 格式（首条为 system）。"""
-    system_content = SYSTEM_PROMPT + (system_suffix or "")
+def _to_openai_messages(req: Request) -> list[dict]:
+    """把 Request 转成 openai 的 messages 格式（单条 system + 尾部 user reminder）。"""
+    system_content = req.system.stable
+    if req.system.environment:
+        system_content += "\n\n" + req.system.environment
     result = [{"role": "system", "content": system_content}]
-    for m in msgs:
+    for m in req.messages:
         if m.role == "tool":
             result.append(
                 {"role": "tool", "tool_call_id": m.tool_call_id, "content": m.content}
@@ -42,6 +41,8 @@ def _to_openai_messages(
             )
         else:
             result.append({"role": m.role, "content": m.content})
+    if req.reminder:
+        result.append({"role": "user", "content": req.reminder})
     return result
 
 
@@ -80,21 +81,16 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[dict] | None = None,
-        system_suffix: str | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，yield 文本增量与工具调用。thinking 字段忽略。"""
         kwargs = {
             "model": self._model,
-            "messages": _to_openai_messages(msgs, system_suffix),
+            "messages": _to_openai_messages(req),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tools:
-            kwargs["tools"] = _to_openai_tools(tools)
+        if req.tools:
+            kwargs["tools"] = _to_openai_tools(req.tools)
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)
@@ -105,9 +101,12 @@ class OpenAIProvider:
 
             async for chunk in stream:
                 if chunk.usage:
+                    details = getattr(chunk.usage, "prompt_tokens_details", None)
                     usage = TokenUsage(
                         input_tokens=chunk.usage.prompt_tokens or 0,
                         output_tokens=chunk.usage.completion_tokens or 0,
+                        cache_write=0,
+                        cache_read=getattr(details, "cached_tokens", 0) or 0,
                     )
                 if not chunk.choices:
                     continue

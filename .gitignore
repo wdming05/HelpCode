@@ -17,3 +17,8 @@ _archive_v1_tools/
 # 编辑器
 .idea/
 .vscode/
+
+# 开发的本地文档（不提交到仓库）
+ch03-*.md
+ch04-*.md
+ch05-*.md

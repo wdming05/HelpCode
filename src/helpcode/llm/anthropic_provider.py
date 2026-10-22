@@ -7,12 +7,11 @@ from collections.abc import AsyncIterator
 from anthropic import AsyncAnthropic
 
 from ..config import ProviderConfig
-from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, TokenUsage, ToolCall
+from . import Message, Request, StreamEvent, System, TokenUsage, ToolCall
 
 
-def _to_anthropic_messages(msgs: list[Message]) -> list[dict]:
-    """把内部 Message 转成 anthropic 的 messages 格式。"""
+def _to_anthropic_messages(msgs: list[Message], reminder: str = "") -> list[dict]:
+    """把内部 Message 转成 anthropic 的 messages 格式，末尾织入 reminder。"""
     result = []
     for m in msgs:
         if m.role == "tool":
@@ -47,6 +46,18 @@ def _to_anthropic_messages(msgs: list[Message]) -> list[dict]:
             )
         else:
             result.append({"role": m.role, "content": m.content})
+
+    # reminder 织入：追加到末条 user 的 content 块；末条非 user 则新起 user
+    if reminder:
+        block = {"type": "text", "text": reminder}
+        if result and result[-1]["role"] == "user":
+            content = result[-1]["content"]
+            if isinstance(content, list):
+                content.append(block)
+            else:
+                result[-1]["content"] = [{"type": "text", "text": content}, block]
+        else:
+            result.append({"role": "user", "content": [block]})
     return result
 
 
@@ -60,6 +71,22 @@ def _to_anthropic_tools(tools: list[dict]) -> list[dict]:
         }
         for t in tools
     ]
+
+
+def _to_anthropic_system(system: System) -> list[dict]:
+    """构造 anthropic 的 system 块：稳定段带 cache_control，环境段不带。"""
+    blocks = []
+    if system.stable:
+        blocks.append(
+            {
+                "type": "text",
+                "text": system.stable,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    if system.environment:
+        blocks.append({"type": "text", "text": system.environment})
+    return blocks
 
 
 class AnthropicProvider:
@@ -83,21 +110,16 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[dict] | None = None,
-        system_suffix: str | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        """发起一轮流式对话，yield 文本增量与工具调用；思考增量内部丢弃。"""
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        """发起一轮流式对话；思考增量内部丢弃。"""
         params = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT + (system_suffix or ""),
-            "messages": _to_anthropic_messages(msgs),
+            "system": _to_anthropic_system(req.system),
+            "messages": _to_anthropic_messages(req.messages, req.reminder),
         }
-        if tools:
-            params["tools"] = _to_anthropic_tools(tools)
+        if req.tools:
+            params["tools"] = _to_anthropic_tools(req.tools)
         if self._thinking:
             params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
@@ -139,6 +161,14 @@ class AnthropicProvider:
                         usage = TokenUsage(
                             input_tokens=event.usage.input_tokens or 0,
                             output_tokens=event.usage.output_tokens or 0,
+                            cache_write=getattr(
+                                event.usage, "cache_creation_input_tokens", 0
+                            )
+                            or 0,
+                            cache_read=getattr(
+                                event.usage, "cache_read_input_tokens", 0
+                            )
+                            or 0,
                         )
 
                 if usage is not None:

@@ -14,6 +14,8 @@ class TokenUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write: int = 0  # 写入缓存的 input token 数
+    cache_read: int = 0  # 命中缓存的 input token 数
 
 
 @dataclass
@@ -45,6 +47,24 @@ class StreamEvent:
     err: Exception | None = None  # 出错（与 done 互斥）
 
 
+@dataclass
+class System:
+    """系统提示：稳定段（可缓存）+ 环境段（不缓存）。"""
+
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass
+class Request:
+    """一次对话请求的完整装配。"""
+
+    messages: list[Message]
+    tools: list[dict] | None = None
+    system: System = field(default_factory=System)
+    reminder: str = ""
+
+
 class Provider(Protocol):
     """协议无关的 provider 接口。"""
 
@@ -54,14 +74,7 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    # tools 为 Registry.export() 的统一格式，各适配器内部转成本协议格式
-    # system_suffix：追加到 system prompt 尾部（Plan Mode 提示词）
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[dict] | None = None,
-        system_suffix: str | None = None,
-    ) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: ProviderConfig) -> Provider:

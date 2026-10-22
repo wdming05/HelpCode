@@ -135,7 +135,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
 
     def _setup_agent(self) -> None:
         """provider 确定后，构造 Agent（持有会话与工具注册中心）。"""
-        self.agent = Agent(self.provider, new_default_registry())
+        self.agent = Agent(self.provider, new_default_registry(), __version__)
 
     async def submit(self, text: str) -> None:
         """处理一次输入提交。"""
