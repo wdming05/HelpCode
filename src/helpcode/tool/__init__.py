@@ -1,7 +1,8 @@
 """工具抽象与注册中心。"""
 
+import sys
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 # 命令执行默认超时（秒）
 DEFAULT_TIMEOUT = 30.0
@@ -13,6 +14,7 @@ class ToolResult:
 
     ok: bool
     content: str
+    is_error: bool = False  # True=权限拒绝/结构化错误（UI 用红色拒绝样式区分）
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -33,6 +35,16 @@ class Tool(Protocol):
     def run(self, **kwargs: Any) -> ToolResult: ...
 
 
+@runtime_checkable
+class AsyncTool(Protocol):
+    """异步工具协议：远端工具（如 MCP）只需实现 arun，无需实现同步 run。
+
+    runtime_checkable 让 isinstance 退化为「有没有 arun 方法」——正是分流需要的信息。
+    """
+
+    async def arun(self, **kwargs: Any) -> ToolResult: ...
+
+
 class Registry:
     """工具注册中心：登记工具、按名查找、导出统一工具定义。"""
 
@@ -40,6 +52,11 @@ class Registry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
+        if tool.name in self._tools:
+            print(
+                f"[warn] 工具重名，后注册者覆盖: {tool.name}",
+                file=sys.stderr,
+            )
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool | None:

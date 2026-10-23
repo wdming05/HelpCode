@@ -1,21 +1,36 @@
 """Agent Loop：多轮循环，自主调用工具直到满足停止条件。"""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from enum import Enum
 
 from . import prompt
 from .conversation import Conversation
 from .llm import Provider, Request, System, TokenUsage, ToolCall
-from .tool import Registry, ToolResult
+from .permission import (
+    Decision,
+    Engine,
+    Mode,
+    Outcome,
+    check,
+    friendly_name,
+    persist_local_allow,
+)
+from .tool import AsyncTool, Registry, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
-class Mode(Enum):
-    """会话模式。"""
+@dataclass
+class PermissionRequest:
+    """人在回路：待批准的工具调用（respond 是回填句柄）。"""
 
-    NORMAL = "normal"
-    PLAN = "plan"
+    tool_call: ToolCall
+    friendly_name: str
+    preview: str
+    reason: str
+    respond: asyncio.Future  # Future[Outcome]
 
 
 @dataclass
@@ -29,12 +44,13 @@ class AgentEvent:
     token_usage: TokenUsage | None = None  # 一轮结束时的用量
     iteration: int | None = None  # 当前迭代轮次（进度）
     notice: str | None = None  # 停止提示（非错误）
+    permission_request: PermissionRequest | None = None  # 人在回路请求
     done: bool = False  # 本轮（一次 run）结束
     err: Exception | None = None  # LLM 流出错
 
 
 class Agent:
-    """多轮循环：输入 → 流式 → 执行工具 → 回灌 → 循环，直到停止条件。"""
+    """多轮循环：输入 → 流式 → 权限检查 → 执行工具 → 回灌 → 循环。"""
 
     MAX_ITERATIONS = 25
     MAX_UNKNOWN_RUN = 3
@@ -42,18 +58,19 @@ class Agent:
     PLAN_REMINDER_INTERVAL = 4
 
     def __init__(
-        self, provider: Provider, registry: Registry, version: str = "dev"
+        self, provider: Provider, registry: Registry, version: str, engine: Engine
     ) -> None:
         self.provider = provider
         self.registry = registry
         self._version = version
+        self.engine = engine
 
     async def run(
         self,
         user_input: str,
         conv: Conversation,
         cancel_event: asyncio.Event,
-        mode: Mode = Mode.NORMAL,
+        mode: Mode,
     ) -> AsyncIterator[AgentEvent]:
         conv.add_user(user_input)
         unknown_run = 0
@@ -119,8 +136,14 @@ class Agent:
                 yield AgentEvent(done=True)
                 return
 
-            # 执行（并发/串行），结果按原始顺序回灌
-            results = await self._execute_calls(tool_calls)
+            # 执行（批次内权限检查 + 并发/串行），结果按原始顺序回灌
+            results: list[ToolResult] = [
+                ToolResult(ok=False, content="(未执行)") for _ in tool_calls
+            ]
+            async for ev in self._execute_calls(
+                tool_calls, mode, cancel_event, results
+            ):
+                yield ev
             for call in tool_calls:
                 yield AgentEvent(tool_start=call)
             for call, result in zip(tool_calls, results):
@@ -167,59 +190,135 @@ class Agent:
         out["tool_calls"] = tool_calls
         out["usage"] = usage
 
-    async def _execute_calls(self, calls: list[ToolCall]) -> list[ToolResult]:
-        """并发/串行调度：连续只读并发、副作用串行，结果按原始下标。"""
-        results: list[ToolResult] = [
-            ToolResult(ok=False, content="(未执行)") for _ in calls
-        ]
+    async def _execute_calls(
+        self,
+        calls: list[ToolCall],
+        mode: Mode,
+        cancel_event: asyncio.Event,
+        results: list[ToolResult],
+    ) -> AsyncIterator[AgentEvent]:
+        """批次循环内权限检查 + 并发/串行执行；yield permission_request。"""
         i = 0
         while i < len(calls):
             name = calls[i].name
+            # 未知工具分层：registry 不存在 → 直接报错，不进权限流水线
             if self.registry.get(name) is None:
-                results[i] = ToolResult(ok=False, content=f"错误：未知工具 {name}")
+                results[i] = ToolResult(
+                    ok=False, content=f"未知工具: {name}", is_error=True
+                )
                 i += 1
                 continue
 
             if self.registry.is_read_only(name):
-                # 收集连续只读段
+                # 连续只读段：check（Deny 预置不进 gather，Allow 并发）
                 batch = [i]
                 j = i + 1
                 while j < len(calls) and self.registry.is_read_only(calls[j].name):
                     batch.append(j)
                     j += 1
-                # 并发执行整个批（整体超时，避免卡死）
+                to_run: list[int] = []
+                for k in batch:
+                    decision, reason = check(self.engine, mode, calls[k], True)
+                    if decision is Decision.DENY:
+                        results[k] = ToolResult(ok=False, content=reason, is_error=True)
+                    else:  # 只读永不 Ask
+                        to_run.append(k)
                 try:
-                    batch_results = await asyncio.wait_for(
-                        asyncio.gather(*[self._execute_one(calls[k]) for k in batch]),
+                    gathered = await asyncio.wait_for(
+                        asyncio.gather(*[self._execute_one(calls[k]) for k in to_run]),
                         timeout=self.BATCH_TIMEOUT,
                     )
                 except TimeoutError:
-                    batch_results = [
+                    gathered = [
                         ToolResult(
                             ok=False,
                             content=f"错误：工具批执行超时（>{self.BATCH_TIMEOUT}s）",
+                            is_error=True,
                         )
-                        for _ in batch
+                        for _ in to_run
                     ]
-                for k, r in zip(batch, batch_results):
+                for k, r in zip(to_run, gathered):
                     results[k] = r
                 i = j
             else:
-                # 副作用调用：串行
-                results[i] = await self._execute_one(calls[i])
+                # 副作用串行：check → ALLOW 执行 / DENY 预置 / ASK 人在回路
+                decision, reason = check(self.engine, mode, calls[i], False)
+                if decision is Decision.DENY:
+                    results[i] = ToolResult(ok=False, content=reason, is_error=True)
+                elif decision is Decision.ALLOW:
+                    results[i] = await self._execute_one(calls[i])
+                else:  # ASK
+                    out: dict = {}
+                    async for ev in self._request_approval(
+                        calls[i], reason, cancel_event, out
+                    ):
+                        yield ev
+                    if out.get("cancelled"):
+                        results[i] = ToolResult(
+                            ok=False, content="已取消", is_error=True
+                        )
+                        return  # 取消：停止后续执行，交上层收尾
+                    outcome = out.get("outcome")
+                    if outcome is Outcome.ALLOW_FOREVER:
+                        try:
+                            persist_local_allow(self.engine, calls[i])
+                        except Exception:
+                            logger.warning("持久化永久放行规则失败", exc_info=True)
+                        results[i] = await self._execute_one(calls[i])
+                    elif outcome is Outcome.ALLOW_ONCE:
+                        results[i] = await self._execute_one(calls[i])
+                    else:  # DENY_ONCE
+                        results[i] = ToolResult(
+                            ok=False, content="用户拒绝该操作", is_error=True
+                        )
                 i += 1
-        return results
+
+    async def _request_approval(
+        self,
+        call: ToolCall,
+        reason: str,
+        cancel_event: asyncio.Event,
+        out: dict,
+    ) -> AsyncIterator[AgentEvent]:
+        """人在回路：yield permission_request，结果写入 out（outcome/cancelled）。"""
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        req = PermissionRequest(
+            tool_call=call,
+            friendly_name=friendly_name(call.name),
+            preview=_preview_args(call.input),
+            reason=reason,
+            respond=future,
+        )
+        yield AgentEvent(permission_request=req)
+        _done, pending = await asyncio.wait(
+            [asyncio.ensure_future(future), asyncio.create_task(cancel_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if cancel_event.is_set():
+            out["cancelled"] = True
+            return
+        out["outcome"] = future.result()
 
     async def _execute_one(self, call: ToolCall) -> ToolResult:
         """执行一个工具调用；未知工具/异常均包成 ToolResult。"""
         tool = self.registry.get(call.name)
         if tool is None:
-            return ToolResult(ok=False, content=f"错误：未知工具 {call.name}")
+            return ToolResult(
+                ok=False, content=f"错误：未知工具 {call.name}", is_error=True
+            )
         try:
+            # 异步工具（MCP 等）直接在事件循环里跑：它们的会话绑定 loop，
+            # 丢进线程池调用必然失败。
+            if isinstance(tool, AsyncTool):
+                return await tool.arun(**call.input)
             # 同步工具函数放到线程执行，避免阻塞事件循环
             return await asyncio.to_thread(tool.run, **call.input)
         except Exception as e:
-            return ToolResult(ok=False, content=f"错误：工具执行失败 {e}")
+            return ToolResult(
+                ok=False, content=f"错误：工具执行失败 {e}", is_error=True
+            )
 
     def _ensure_assistant_tail(self, conv: Conversation, text: str) -> None:
         """确保历史以 assistant 消息结尾（终止时的统一收尾，防 400）。"""
@@ -231,5 +330,16 @@ class Agent:
         msgs = conv.messages()
         if msgs and msgs[-1].role == "assistant" and msgs[-1].tool_calls:
             for tc in msgs[-1].tool_calls:
-                conv.add_tool_result(tc.id, ToolResult(ok=False, content="已取消"))
+                conv.add_tool_result(
+                    tc.id, ToolResult(ok=False, content="已取消", is_error=True)
+                )
         self._ensure_assistant_tail(conv, "已取消")
+
+
+def _preview_args(input: dict) -> str:
+    """提取关键参数做简要预览。"""
+    for key in ("path", "command", "pattern"):
+        if key in input:
+            s = str(input[key])
+            return s if len(s) <= 40 else s[:40] + "…"
+    return ""

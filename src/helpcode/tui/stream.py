@@ -10,6 +10,7 @@ from .view import (
     error_block,
     render_markdown,
     render_notice,
+    render_permission_request,
     render_token_usage,
     render_tool_end,
     render_tool_start,
@@ -42,6 +43,14 @@ class StreamMixin:
                     log.write(render_tool_end(ev.tool_call, ev.tool_end))
                 if ev.token_usage is not None:
                     usage = ev.token_usage
+                if ev.permission_request is not None:
+                    self._pending_request = ev.permission_request
+                    self._approve_cursor = 0
+                    self.state = SessionState.APPROVING
+                    self.set_focus(None)  # 移走焦点，让 App 级 on_key 处理选择按键
+                    self.query_one("#streaming", Static).update(
+                        render_permission_request(ev.permission_request, 0)
+                    )
                 if ev.notice is not None:
                     log = self.query_one("#log", RichLog)
                     log.write(render_notice(ev.notice))

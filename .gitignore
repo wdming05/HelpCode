@@ -10,6 +10,7 @@ dist/
 
 # HelpCode 配置（含密钥，不入库）
 .helpcode/config.yaml
+.helpcode/settings.local.yaml
 
 # 归档的旧版本
 _archive_v1_tools/

@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6",
     "python-dotenv>=1.2.4",
     "path>=17.1.1",
+    "mcp>=1.0,<2",
 ]
 
 [project.scripts]
@@ -25,6 +26,11 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+# 设计文档里的 Python 代码块是「说明」不是「源码」，
+# 不能让 ruff format 去改写它们（ch06 遗留下来的门禁红就是它造成的）。
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 # RUF012：Textual 框架要求用 BINDINGS 类属性（可变默认值属框架约定）

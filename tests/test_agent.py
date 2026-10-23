@@ -1,12 +1,14 @@
-"""Agent 多轮循环单测（假 Provider，新 Request 签名）。"""
+"""Agent 多轮循环单测（假 Provider，权限集成）。"""
 
 import asyncio
+import tempfile
 import threading
 import time
 
-from helpcode.agent import Agent, Mode
+from helpcode.agent import Agent
 from helpcode.conversation import Conversation
 from helpcode.llm import StreamEvent, TokenUsage, ToolCall
+from helpcode.permission import Mode, Outcome, new_engine
 from helpcode.prompt import plan_reminder
 from helpcode.tool import Registry, ToolResult
 
@@ -79,15 +81,21 @@ class FakeProvider:
             yield ev
 
 
-def _collect(agent, text, conv, cancel, mode=Mode.NORMAL):
+def _make_agent(provider, registry):
+    """构造 Agent（四参显式 + 临时目录引擎）。"""
+    engine, _ = new_engine(tempfile.mkdtemp())
+    return Agent(provider, registry, "dev", engine)
+
+
+def _collect(agent, text, conv, cancel, mode=Mode.DEFAULT):
     async def _run():
         return [ev async for ev in agent.run(text, conv, cancel, mode)]
 
     return asyncio.run(_run())
 
 
-def _tool_calls(ids):
-    return [ToolCall(id=cid, name="fake_tool", input={}) for cid in ids]
+def _tool_calls(ids, name="fake_tool"):
+    return [ToolCall(id=cid, name=name, input={}) for cid in ids]
 
 
 # A：多轮循环
@@ -100,7 +108,7 @@ def test_agent_multi_round():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
 
@@ -116,7 +124,7 @@ def test_agent_multi_round():
 def test_agent_plain_text():
     rounds = [[StreamEvent(text="你好"), StreamEvent(done=True)]]
     provider = FakeProvider(rounds)
-    agent = Agent(provider, Registry(), "dev")
+    agent = _make_agent(provider, Registry())
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert all(e.tool_start is None for e in events)
@@ -134,7 +142,7 @@ def test_agent_mixed_drops_tools():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert all(e.tool_end is None for e in events)
@@ -160,9 +168,10 @@ def test_agent_concurrent_readonly_serial_sideeffect():
         [StreamEvent(done=True, tool_calls=calls)],
         [StreamEvent(text="完成"), StreamEvent(done=True)],
     ]
-    agent = Agent(FakeProvider(rounds), registry, "dev")
+    agent = _make_agent(FakeProvider(rounds), registry)
     conv = Conversation()
-    events = _collect(agent, "hi", conv, asyncio.Event())
+    # bypass 模式：非内置副作用工具归 EXEC 类会 Ask，bypass 全放行以隔离调度逻辑验证
+    events = _collect(agent, "hi", conv, asyncio.Event(), mode=Mode.BYPASS)
 
     assert tracker.max_active >= 2, f"并发峰值应 >=2，实际 {tracker.max_active}"
     assert tracker.completed[-1] == "side_c"
@@ -180,13 +189,13 @@ def test_agent_cancel():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
 
     async def _run():
         cancel = asyncio.Event()
         events = []
-        async for ev in agent.run("hi", conv, cancel):
+        async for ev in agent.run("hi", conv, cancel, Mode.DEFAULT):
             events.append(ev)
             if ev.tool_end is not None:
                 cancel.set()
@@ -210,7 +219,7 @@ def test_agent_plan_mode():
     registry = Registry()
     registry.register(FakeTool("ro", read_only=True))
     registry.register(FakeTool("w", read_only=False))
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     _collect(agent, "hi", conv, asyncio.Event(), mode=Mode.PLAN)
     req = provider.requests[0]
@@ -228,7 +237,7 @@ def test_agent_max_iterations():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert any(e.notice == "已达到最大迭代次数" for e in events)
@@ -250,7 +259,7 @@ def test_agent_unknown_tool():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert any(e.notice == "连续请求未知工具，已停止" for e in events)
@@ -260,13 +269,13 @@ def test_agent_unknown_tool():
 def test_agent_stream_error():
     rounds = [[StreamEvent(err=RuntimeError("boom"))]]
     provider = FakeProvider(rounds)
-    agent = Agent(provider, Registry(), "dev")
+    agent = _make_agent(provider, Registry())
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert any(e.err is not None for e in events)
 
 
-# 新增：规划模式按轮次 reminder（iter1 完整、iter2 精简）
+# 规划模式按轮次 reminder（iter1 完整、iter2 精简）
 def test_plan_reminder_per_iteration():
     rounds = [
         [StreamEvent(done=True, tool_calls=_tool_calls(["c1"]))],
@@ -275,30 +284,30 @@ def test_plan_reminder_per_iteration():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     _collect(agent, "hi", conv, asyncio.Event(), mode=Mode.PLAN)
     assert provider.requests[0].reminder == plan_reminder(True)
     assert provider.requests[1].reminder == plan_reminder(False)
 
 
-# 新增：稳定系统提示跨模式一致
+# 稳定系统提示跨模式一致
 def test_stable_consistent_across_modes():
     rounds = [[StreamEvent(done=True)]]
     p1 = FakeProvider(rounds)
     reg1 = Registry()
     reg1.register(FakeTool())
-    _collect(Agent(p1, reg1, "dev"), "hi", Conversation(), asyncio.Event())
+    _collect(_make_agent(p1, reg1), "hi", Conversation(), asyncio.Event())
     p2 = FakeProvider(rounds)
     reg2 = Registry()
     reg2.register(FakeTool())
     _collect(
-        Agent(p2, reg2, "dev"), "hi", Conversation(), asyncio.Event(), mode=Mode.PLAN
+        _make_agent(p2, reg2), "hi", Conversation(), asyncio.Event(), mode=Mode.PLAN
     )
     assert p1.requests[0].system.stable == p2.requests[0].system.stable
 
 
-# 新增：cache 用量透传
+# cache 用量透传
 def test_cache_usage_transparent():
     rounds = [
         [
@@ -311,14 +320,14 @@ def test_cache_usage_transparent():
         ]
     ]
     provider = FakeProvider(rounds)
-    agent = Agent(provider, Registry(), "dev")
+    agent = _make_agent(provider, Registry())
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     usages = [e.token_usage for e in events if e.token_usage is not None]
     assert usages and usages[0].cache_write == 10 and usages[0].cache_read == 8
 
 
-# 新增：reminder 不写历史
+# reminder 不写历史
 def test_reminder_not_in_history():
     rounds = [
         [StreamEvent(done=True, tool_calls=_tool_calls(["c1"]))],
@@ -327,8 +336,147 @@ def test_reminder_not_in_history():
     provider = FakeProvider(rounds)
     registry = Registry()
     registry.register(FakeTool())
-    agent = Agent(provider, registry, "dev")
+    agent = _make_agent(provider, registry)
     conv = Conversation()
     _collect(agent, "hi", conv, asyncio.Event(), mode=Mode.PLAN)
     for m in conv.messages():
         assert "<system-reminder>" not in m.content
+
+
+# ============ ch06 权限集成 ============
+
+
+# 黑名单拒绝回灌（不中断，Loop 继续）
+def test_agent_deny_blacklist():
+    rounds = [
+        [
+            StreamEvent(
+                done=True,
+                tool_calls=[
+                    ToolCall(id="c1", name="bash", input={"command": "rm -rf /"})
+                ],
+            )
+        ],
+        [StreamEvent(text="我改用别的方式"), StreamEvent(done=True)],
+    ]
+    provider = FakeProvider(rounds)
+    registry = Registry()
+    registry.register(FakeTool("bash", read_only=False))
+    agent = _make_agent(provider, registry)
+    conv = Conversation()
+    events = _collect(agent, "hi", conv, asyncio.Event())
+
+    deny_ends = [e.tool_end for e in events if e.tool_end is not None]
+    assert any("黑名单" in r.content and r.is_error for r in deny_ends), (
+        "应回灌黑名单拒绝"
+    )
+    assert conv.messages()[-1].content == "我改用别的方式", "Loop 应继续"
+
+
+# 人在回路：Ask → 允许本次
+def test_agent_ask_allow_once():
+    rounds = [
+        [
+            StreamEvent(
+                done=True,
+                tool_calls=[
+                    ToolCall(id="c1", name="write_file", input={"path": "x.txt"})
+                ],
+            )
+        ],
+        [StreamEvent(text="写完了"), StreamEvent(done=True)],
+    ]
+    provider = FakeProvider(rounds)
+    registry = Registry()
+    registry.register(FakeTool("write_file", read_only=False))
+    agent = _make_agent(provider, registry)
+    conv = Conversation()
+
+    async def _run():
+        events = []
+        async for ev in agent.run("写", conv, asyncio.Event(), Mode.DEFAULT):
+            if ev.permission_request is not None:
+                ev.permission_request.respond.set_result(Outcome.ALLOW_ONCE)
+            events.append(ev)
+        return events
+
+    events = asyncio.run(_run())
+    assert any(e.permission_request is not None for e in events), "应触发 Ask"
+    assert any(e.tool_end is not None and e.tool_end.ok for e in events), "允许后应执行"
+
+
+# 人在回路：拒绝本次
+def test_agent_ask_deny_once():
+    rounds = [
+        [
+            StreamEvent(
+                done=True,
+                tool_calls=[
+                    ToolCall(id="c1", name="write_file", input={"path": "x.txt"})
+                ],
+            )
+        ],
+        [StreamEvent(text="那我换个方案"), StreamEvent(done=True)],
+    ]
+    provider = FakeProvider(rounds)
+    registry = Registry()
+    registry.register(FakeTool("write_file", read_only=False))
+    agent = _make_agent(provider, registry)
+    conv = Conversation()
+
+    async def _run():
+        async for ev in agent.run("写", conv, asyncio.Event(), Mode.DEFAULT):
+            if ev.permission_request is not None:
+                ev.permission_request.respond.set_result(Outcome.DENY_ONCE)
+
+    asyncio.run(_run())
+    msgs = conv.messages()
+    # 拒绝后工具结果应含"拒绝"，且 Loop 继续
+    tool_results = [m for m in msgs if m.role == "tool"]
+    assert any("拒绝" in r.content for m in tool_results for r in m.tool_results)
+
+
+# 未知工具（registry 不存在）→ 报错不弹窗
+def test_agent_unknown_tool_no_ask():
+    rounds = [
+        [
+            StreamEvent(
+                done=True,
+                tool_calls=[ToolCall(id="c1", name="ghost_tool", input={})],
+            )
+        ],
+        [StreamEvent(text="x"), StreamEvent(done=True)],
+    ]
+    provider = FakeProvider(rounds)
+    registry = Registry()
+    registry.register(FakeTool())
+    agent = _make_agent(provider, registry)
+    conv = Conversation()
+    events = _collect(agent, "hi", conv, asyncio.Event())
+    assert not any(e.permission_request is not None for e in events), "未知工具不应弹窗"
+    assert any(
+        e.tool_end is not None and "未知工具" in e.tool_end.content for e in events
+    )
+
+
+# 只读批不产生 approval 事件（并发不退化）
+def test_agent_readonly_no_approval():
+    rounds = [
+        [
+            StreamEvent(
+                done=True,
+                tool_calls=[
+                    ToolCall(id="1", name="read_file", input={"path": "a.txt"}),
+                    ToolCall(id="2", name="read_file", input={"path": "b.txt"}),
+                ],
+            )
+        ],
+        [StreamEvent(text="读完"), StreamEvent(done=True)],
+    ]
+    provider = FakeProvider(rounds)
+    registry = Registry()
+    registry.register(FakeTool("read_file", read_only=True))
+    agent = _make_agent(provider, registry)
+    conv = Conversation()
+    events = _collect(agent, "hi", conv, asyncio.Event())
+    assert not any(e.permission_request is not None for e in events), "只读不应触发 Ask"

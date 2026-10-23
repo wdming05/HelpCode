@@ -7,12 +7,13 @@ from rich.table import Table
 from rich.text import Text
 
 from ..llm import TokenUsage, ToolCall
+from ..permission import Mode
 from ..tool import ToolResult
 
 
 def user_block(text: str) -> Text:
-    """用户输入块：加粗前缀 ●。"""
-    return Text("● " + text, style="bold")
+    """用户输入块：加粗青色前缀 ●，带显式颜色确保各终端可见。"""
+    return Text("● " + text, style="bold cyan")
 
 
 def render_markdown(reply: str) -> Markdown:
@@ -25,13 +26,38 @@ def error_block(err: Exception) -> Text:
     return Text("● 错误: " + str(err), style="bold red")
 
 
-def render_statusbar(name: str, model: str) -> Table:
-    """状态栏：左 provider 名、右模型名，两端对齐。"""
+_MODE_STYLE = {
+    Mode.DEFAULT: "green",
+    Mode.ACCEPT_EDITS: "cyan",
+    Mode.PLAN: "yellow",
+    Mode.BYPASS: "red",
+}
+
+
+def render_statusbar(mode: Mode, model: str) -> Table:
+    """状态栏：左权限模式名（配色）、右模型名，两端对齐。"""
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1, justify="left")
     grid.add_column(ratio=1, justify="right")
-    grid.add_row(Text(name, style="bold"), Text(model))
+    style = _MODE_STYLE.get(mode, "")
+    grid.add_row(Text(str(mode), style=f"bold {style}"), Text(model))
     return grid
+
+
+def render_permission_request(req, cursor: int = 0) -> Text:
+    """渲染待批准确认块：动作名 + 参数 + 原因 + 三选项菜单。"""
+    lines = [
+        Text(f"● {req.friendly_name}({req.preview})", style="bold cyan"),
+        Text(f"  {req.reason}", style="dim"),
+        Text("是否继续?", style="bold"),
+    ]
+    options = ["允许本次", "永久放行", "拒绝本次"]
+    for idx, opt in enumerate(options):
+        prefix = ">" if idx == cursor else " "
+        style = "bold" if idx == cursor else ""
+        lines.append(Text(f"  {prefix} {opt}", style=style))
+    lines.append(Text("↑↓ 选择 · 回车确认 · Esc 取消", style="dim"))
+    return Text("\n").join(lines)
 
 
 def _summarize_args(input: dict, limit: int = 40) -> str:
