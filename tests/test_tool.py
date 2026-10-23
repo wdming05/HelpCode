@@ -134,3 +134,27 @@ def test_grep(tmp_path):
     assert r.ok
     assert "class A:" in r.content
     assert "2:" in r.content
+
+
+def test_register_duplicate_warns(capsys):
+    """同名工具重复注册：stderr 告警，且后注册者生效（F8）。"""
+    from helpcode.tool import Registry, ToolResult
+
+    class Dummy:
+        name = "dup"
+        description = "d"
+        parameters: dict = {}
+        read_only = True
+
+        def run(self, **kwargs):
+            return ToolResult(ok=True, content="")
+
+    registry = Registry()
+    first = Dummy()
+    second = Dummy()
+    registry.register(first)
+    registry.register(second)
+
+    assert "重名" in capsys.readouterr().err
+    assert registry.get("dup") is second
+    assert len(registry.names()) == 1

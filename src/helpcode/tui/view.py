@@ -85,11 +85,17 @@ def render_tool_end(tool_call: ToolCall, tool_result: ToolResult) -> Text:
 
 
 def render_token_usage(usage: TokenUsage) -> Text:
-    """Token 用量展示（一轮结束定型时入对话区）。"""
-    return Text(
-        f"（{usage.input_tokens} 输入 / {usage.output_tokens} 输出 tokens）",
-        style="dim",
-    )
+    """Token 用量展示（一轮结束定型时入对话区）。
+
+    缓存字段为 0 时不渲染（OpenAI 兼容端点的 cache_write 恒为 0，
+    不返回缓存统计的端点 cache_read 也为 0），避免噪音。
+    """
+    text = f"（{usage.input_tokens} 输入 / {usage.output_tokens} 输出 tokens"
+    if usage.cache_write:
+        text += f" / 缓存写入 {usage.cache_write}"
+    if usage.cache_read:
+        text += f" / 缓存命中 {usage.cache_read}"
+    return Text(text + "）", style="dim")
 
 
 def render_iteration(n: int) -> Text:
