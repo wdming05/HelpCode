@@ -13,6 +13,13 @@ from helpcode.prompt import (
     plan_reminder,
 )
 
+# 无参 build_system_prompt() 的 sha256。
+# 这个值是「两个可选槽都为空」时算出来的：空 content 会被 assemble_system 跳过，
+# 走的代码路径与 ch05 完全相同，所以它与改造前的输出一致。
+# 改动任何一个固定模块的文案，这条都会红——这是刻意的：stable 段一旦变形，
+# ch05 的 prompt 缓存就整段失效。
+_BASELINE_SHA256 = "7d3c2f1e0e9e8ae2b38695b656c4c85994f1732f0146a8b3e53bf3dd06db1b13"
+
 
 def test_fixed_module_order():
     """七固定模块按 priority 10..70 排列。"""
@@ -111,3 +118,47 @@ def test_gather_environment_fields():
     assert env.date  # 日期非空
     assert env.version == "dev"
     assert env.model == "m"
+
+
+# ---------------------------------------------------------------- 两个可选槽（ch09）
+
+
+def test_default_unchanged():
+    """无参调用与改造前**逐字节相同**（AC8）。
+
+    用 sha256 而不是「包含某句」：少一个换行、多一个空段也必须被这条拦住——
+    ch05 的 prompt 缓存按前缀逐字节命中，差一个字节就是整段失效。
+    """
+    import hashlib
+
+    text = build_system_prompt()
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == _BASELINE_SHA256
+    assert "\n\n\n" not in text  # 空槽没有留下多余空行
+
+
+def test_instructions_filled():
+    """指令非空时出现在「工具使用」之后。(AC8)"""
+    text = build_system_prompt(instructions="项目规则：提交前跑 ruff")
+
+    assert "项目规则：提交前跑 ruff" in text
+    # 「优先用专用工具」是「工具使用」模块的正文，用它做位置锚点
+    assert text.index("优先用专用工具") < text.index("项目规则：提交前跑 ruff")
+
+
+def test_memory_filled_after_instructions():
+    """记忆在指令之后（priority 100 > 80）。(AC8)"""
+    text = build_system_prompt(instructions="指令段", memory="记忆段")
+
+    assert text.index("指令段") < text.index("记忆段")
+
+
+def test_only_memory_no_blank_section():
+    """只填记忆时不该留下空段。"""
+    text = build_system_prompt(memory="只有记忆")
+    assert text.count("只有记忆") == 1
+    assert "\n\n\n" not in text
+
+
+def test_empty_strings_same_as_no_args():
+    """显式传两个空串，结果与不传完全一致。"""
+    assert build_system_prompt("", "") == build_system_prompt()

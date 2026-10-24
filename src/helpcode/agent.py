@@ -58,6 +58,14 @@ class AgentEvent:
     err: Exception | None = None  # LLM 流出错
 
 
+# 每 N 轮自然结束提炼一次笔记。默认 1 = 每轮（ch09 spec 已确认的行为）；
+# 改成 5 只是省调用次数，不改变任何断言。
+MEMORY_UPDATE_EVERY = 1
+# 命中这些词时**不看轮次**立即提炼：用户说「记住…」的当下信息量最高，
+# 等到间隔到了再提炼，会被后续对话冲淡。
+MEMORY_SIGNAL_WORDS = ("记住", "以后都", "别再", "下次要", "记一下")
+
+
 class Agent:
     """多轮循环：输入 → 流式 → 权限检查 → 执行工具 → 回灌 → 循环。"""
 
@@ -73,6 +81,8 @@ class Agent:
         version: str,
         engine: Engine,
         context: ContextManager,
+        system_extra: tuple[str, str] = ("", ""),
+        on_turn_end=None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -80,6 +90,12 @@ class Agent:
         self.engine = engine
         # 故意不给默认值：忘记装配就 TypeError，而不是跑到一半才发现没压缩
         self.context = context
+        # （指令, 记忆索引）的**快照**：在构造时定下，整个会话不变。
+        # 若每轮重读，笔记一写文件 stable 就变，ch05 的 prompt 缓存整段失效。
+        self._system_extra = system_extra
+        self._on_turn_end = on_turn_end
+        self._note_tasks: set[asyncio.Task] = set()
+        self._turn_count = 0
 
     async def run(
         self,
@@ -93,7 +109,7 @@ class Agent:
 
         # ch05：采集环境 + 装配稳定 system（一次，循环外）
         env = await prompt.gather_environment(self._version, self.provider.model)
-        sys = prompt.build_system_prompt()
+        sys = prompt.build_system_prompt(*self._system_extra)
         env_text = env.render()
 
         for iteration in range(1, self.MAX_ITERATIONS + 1):
@@ -198,6 +214,7 @@ class Agent:
             # 正常完成：纯文本（无工具），或混合（文本 + 工具）时丢弃工具
             if not tool_calls or text:
                 conv.add_assistant(text)
+                self._maybe_start_note_task(conv)
                 if usage is not None:
                     yield AgentEvent(token_usage=usage)
                 yield AgentEvent(done=True)
@@ -412,6 +429,55 @@ class Agent:
             return ToolResult(
                 ok=False, content=f"错误：工具执行失败 {e}", is_error=True
             )
+
+    # ------------------------------------------------------------ 自动笔记
+
+    def _should_update_notes(self, conv: Conversation) -> bool:
+        """这一轮要不要触发提炼。
+
+        判定顺序：信号词（立即）→ 每轮 → 按间隔取模。
+        """
+        if self._on_turn_end is None:
+            return False
+
+        last_user = next(
+            (m for m in reversed(conv.messages()) if m.role == "user"), None
+        )
+        if last_user is not None and any(
+            word in last_user.content for word in MEMORY_SIGNAL_WORDS
+        ):
+            return True
+
+        if MEMORY_UPDATE_EVERY <= 1:
+            return True
+        return self._turn_count % MEMORY_UPDATE_EVERY == 0
+
+    def _maybe_start_note_task(self, conv: Conversation) -> None:
+        """异步起一个提炼任务，**不 await**：笔记慢不该让用户等。
+
+        任务引用存进集合，退出时由 ``drain_note_tasks`` 统一等待——否则
+        进程退出会把写了一半的笔记丢掉，还会留下 asyncio 的清理告警。
+        """
+        self._turn_count += 1
+        if not self._should_update_notes(conv):
+            return
+
+        task = asyncio.create_task(self._on_turn_end(conv))
+        self._note_tasks.add(task)
+        task.add_done_callback(self._note_tasks.discard)
+
+    async def drain_note_tasks(self, timeout: float = 2.0) -> None:
+        """退出前等沉淀任务收尾；超时就放弃（笔记不值得拖住退出）。"""
+        pending = [t for t in self._note_tasks if not t.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout
+            )
+        except TimeoutError:
+            # Python 3.11+ 里 asyncio.TimeoutError 就是内建 TimeoutError
+            pass
 
     def _ensure_assistant_tail(self, conv: Conversation, text: str) -> None:
         """确保历史以 assistant 消息结尾（终止时的统一收尾，防 400）。"""

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.widgets import OptionList, RichLog, Static, TextArea
+from textual.widgets import Input, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .. import __version__
@@ -15,13 +15,23 @@ from ..config import DEFAULT_WINDOW, ProviderConfig
 from ..context import ContextManager
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
+from ..memory import notes
+from ..memory.session import tool_results_dir
 from ..permission import Mode, Outcome, new_engine
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import new_default_registry
 from . import SessionState
+from .resume import ResumeMixin
 from .select import SelectMixin
 from .stream import StreamMixin
-from .view import render_permission_request, render_statusbar, user_block
+from .view import (
+    render_cleanup,
+    render_permission_request,
+    render_repaired,
+    render_restored,
+    render_statusbar,
+    user_block,
+)
 
 
 class InputArea(TextArea):
@@ -55,7 +65,7 @@ class InputArea(TextArea):
             asyncio.create_task(app.submit(self.text))
 
 
-class HelpCodeApp(StreamMixin, SelectMixin, App):
+class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
     """HelpCode 终端界面。"""
 
     CSS = """
@@ -87,7 +97,18 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
     ]
 
     def __init__(
-        self, providers: list[ProviderConfig], mcp_tools: list | None = None
+        self,
+        providers: list[ProviderConfig],
+        mcp_tools: list | None = None,
+        *,
+        instructions: str = "",
+        memory: str = "",
+        conv: Conversation | None = None,
+        writer=None,
+        restore=None,
+        cleanup=None,
+        sessions: list | None = None,
+        session_id: str | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -97,7 +118,17 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self.provider_cfg: ProviderConfig | None = None
         self.agent: Agent | None = None
         self.engine = None
-        self.conv = Conversation()
+        # 恢复时传入已有的 Conversation；新建时自己造一个
+        self.conv = conv if conv is not None else Conversation()
+        self.writer = writer
+        self.session_id = session_id
+        self._restore = restore
+        self._cleanup = cleanup
+        self.sessions = sessions or []
+        self._resume_items: list = []
+        # 快照：整个会话不变，改笔记文件不会让 stable 变形（N1）
+        self._instructions = instructions
+        self._memory = memory
         self.cancel_event = asyncio.Event()
         self.mode = Mode.DEFAULT
         self.cur_reply = ""
@@ -107,6 +138,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self._timer = None
         self._pending_request = None
         self._approve_cursor = 0
+        # 恢复的会话若已贴窗口，压缩在后台跑；第一轮请求前必须等它收尾（AC16）
+        self._restore_compress_task = None
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="log", wrap=True, markup=False)
@@ -118,11 +151,31 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
                 *[Option(f"{p.name} ({p.model})") for p in self.providers],
                 id="provider_list",
             )
+        # 选会话用的两个控件：默认隐藏，/resume 时显示
+        yield Input(id="resume_filter", placeholder="输入关键字过滤会话…")
+        yield OptionList(id="resume_list")
 
     def on_mount(self) -> None:
-        """启动：写 banner；单 provider 直进 IDLE，多 provider 进 SELECTING。"""
+        """启动：写 banner 与恢复/清理提示；单 provider 直进 IDLE，多 provider 进 SELECTING。"""
         log = self.query_one("#log", RichLog)
         log.write(render_banner(__version__, os.getcwd()))
+
+        # ch09：三个可选提示行，都是「有内容才写」
+        if self._restore is not None:
+            log.write(
+                render_restored(self.session_id or "-", len(self._restore.messages))
+            )
+            repaired = render_repaired(self._restore.summary_line())
+            if repaired.plain:
+                log.write(repaired)
+        if self._cleanup is not None:
+            cleanup_line = render_cleanup(self._cleanup.banner_line())
+            if cleanup_line.plain:
+                log.write(cleanup_line)
+
+        # 选会话组件默认隐藏
+        self.query_one("#resume_filter", Input).display = False
+        self.query_one("#resume_list", OptionList).display = False
 
         if len(self.providers) == 1:
             self.provider_cfg = self.providers[0]
@@ -165,10 +218,109 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
             window = cfg.context_window
         else:  # 手工构造的 provider（测试）没有配置对象，按 openai 协议默认
             window = DEFAULT_WINDOW[cfg.protocol if cfg else "openai"]
-        self.context = ContextManager(self.provider, Path(os.getcwd()), window)
-        self.agent = Agent(
-            self.provider, registry, __version__, self.engine, self.context
+        self.context = ContextManager(
+            self.provider,
+            Path(os.getcwd()),
+            window,
+            spill_subdir=tool_results_dir(Path(os.getcwd()), self.session_id),
         )
+        self.agent = Agent(
+            self.provider,
+            registry,
+            __version__,
+            self.engine,
+            self.context,
+            system_extra=(self._instructions, self._memory),
+            on_turn_end=self._note_hook,
+        )
+
+        # AC41：新建会话时 writer 是在 cli 里建的，那时还没选 provider，model 是空串。
+        # 现在 provider 定了，回填——否则整个新会话的每一行都没有 model 字段。
+        if self.writer is not None:
+            self.writer.set_model(self.provider.model)
+
+        # ch09：恢复的会话如果已经贴着窗口，先压一次再让用户输入，
+        # 否则第一轮请求必然撞 400（这时还没吐任何字，压缩是安全的）。
+        #
+        # 这里只能建 task 不能 await（`_setup_agent` 是同步的，且压缩要调 LLM）。
+        # 但**必须把 task 存下来**：`submit()` 在第一轮请求前会 await 它。
+        # 早先的版本直接 `create_task(...)` 丢掉引用——用户手快就能在压缩完成前
+        # 提交，那时历史仍是压缩前的，第一轮照样撞 400，AC16 只是看起来成立。
+        if (
+            self._restore is not None
+            and self._restore.messages
+            and self.context.should_compress(self.conv)
+        ):
+            self._restore_compress_task = asyncio.create_task(
+                self._compress_after_restore()
+            )
+
+    async def _await_restore_compress(self) -> None:
+        """等「恢复后压缩」收尾。最多等一次，异常不外抛。"""
+        task, self._restore_compress_task = self._restore_compress_task, None
+        if task is None:
+            return
+        try:
+            await task
+        except Exception as exc:  # 压缩失败不该拦住对话：后续还有 ch08 的撞墙路径
+            self.query_one("#log", RichLog).write(
+                f"（恢复后压缩失败：{exc.__class__.__name__}）"
+            )
+
+    async def _compress_after_restore(self) -> None:
+        log = self.query_one("#log", RichLog)
+        report = await self.agent.compact_now(self.conv)
+        if report.notice:
+            log.write(report.notice)
+
+    async def _note_hook(self, conv: Conversation) -> None:
+        """每轮自然停下后的沉淀入口。
+
+        异常全吞：笔记失败不该在 UI 上弹任何东西——用户没主动要求记忆，
+        不该因为记忆坏了而看到报错。
+        """
+        if self.provider is None:
+            return
+        try:
+            await notes.update(
+                self.provider,
+                conv.messages(),
+                self._memory,
+                _home_memory_dir(),
+                Path(os.getcwd()) / ".helpcode" / "memory",
+            )
+        except Exception as exc:  # 兜底，连 notes 自己的兜底都漏了才算
+            log = self.query_one("#log", RichLog)
+            log.write(f"（笔记更新跳过：{exc.__class__.__name__}）")
+
+    def _apply_resume(self, meta) -> None:
+        """切换到选中的会话：历史、存档、落盘目录三者一起换。"""
+        from ..memory.restore import restore as restore_session
+
+        report = restore_session(meta.jsonl)
+        self.conv = Conversation.from_messages(
+            report.messages,
+            on_append=self._writer_append,
+            on_replace=self._writer_replace,
+        )
+        self.writer = _open_writer(
+            meta.jsonl, self.provider.model if self.provider else ""
+        )
+        self.session_id = meta.session_id
+        if self.provider is not None:
+            self._setup_agent()  # 重建 ContextManager，让 spill 指向新会话目录
+        self.query_one("#log", RichLog).write(
+            render_restored(meta.session_id, len(report.messages))
+        )
+
+    def _writer_append(self, msg) -> None:
+        if self.writer is not None:
+            self.writer.append(msg)
+
+    def _writer_replace(self, msgs) -> None:
+        if self.writer is not None:
+            self.writer.write_compact_marker()
+            self.writer.append_all(msgs)
 
     async def submit(self, text: str) -> None:
         """处理一次输入提交。"""
@@ -180,6 +332,11 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         if text == "/exit":
             await self.action_quit()
             return
+
+        # AC16：恢复后那次压缩必须先落地。放在 `/exit` 之后、所有真正用到历史的
+        # 分支之前——`/compact`、`/resume`、普通提问都会读 `self.conv`。
+        await self._await_restore_compress()
+
         if text == "/plan":
             self.mode = Mode.PLAN
             self._update_statusbar()
@@ -196,6 +353,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
             log.write(user_block("/compact"))
             report = await self.agent.compact_now(self.conv)
             log.write(report.notice or "无需压缩")
+            return
+        if text == "/resume":
+            self.query_one("#log", RichLog).write(user_block("/resume"))
+            self._enter_resume()
             return
 
         self.cancel_event = asyncio.Event()  # 每次提交重置取消信号
@@ -270,7 +431,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self.query_one("#input", InputArea).focus()
 
     async def action_cancel(self) -> None:
-        """Esc：流式/待批准态取消当前循环（协作式，不退出程序）。"""
+        """Esc：选会话/流式/待批准态各自取消当前动作（不退出程序）。"""
+        if self.state == SessionState.RESUMING:
+            self._exit_resume()
+            return
         if self.state == SessionState.APPROVING:
             # 先 resolve future 解开 agent 等待，再置取消信号
             if (
@@ -290,4 +454,28 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             await self.action_cancel()
         else:
+            # 退出前等沉淀任务收尾，再关文件——否则写了一半的笔记会丢
+            await self._await_restore_compress()  # 压缩也在写 jsonl，先等它
+            if self.agent is not None:
+                await self.agent.drain_note_tasks()
+            if self.writer is not None:
+                self.writer.close()
             self.exit()
+
+    def on_option_list_option_selected(self, event) -> None:
+        """两个 OptionList 共用一个事件：按 id 分派。"""
+        if getattr(event.option_list, "id", None) == "resume_list":
+            self._select_session(event.option_index)
+            return
+        # 否则是 provider 选择（沿用 SelectMixin 的行为）
+        super().on_option_list_option_selected(event)
+
+
+def _home_memory_dir() -> Path:
+    return Path.home() / ".helpcode" / "memory"
+
+
+def _open_writer(jsonl: Path, model: str):
+    from ..memory.session import SessionWriter
+
+    return SessionWriter(jsonl, model)

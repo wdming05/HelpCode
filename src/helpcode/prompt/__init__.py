@@ -21,9 +21,13 @@ __all__ = [
 ]
 
 
-def build_system_prompt() -> str:
-    """装配稳定 system 文本（七个固定模块 + 三个可选空槽），不含环境/时间内容。"""
-    return assemble_system(fixed_modules() + optional_modules())
+def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+    """装配稳定 system 文本（七个固定模块 + 三个可选槽），不含环境/时间内容。
+
+    两段文本进的是**稳定段**：它们在会话内是快照（装配层只算一次），
+    所以改笔记文件不会让下一轮的 stable 变化，缓存仍然命中（N1）。
+    """
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
 
 
 # ASCII 猫 banner

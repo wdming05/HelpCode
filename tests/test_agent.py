@@ -677,3 +677,151 @@ def test_agent_requires_context_argument():
         assert "context" in str(e)
     else:  # pragma: no cover
         raise AssertionError("缺少 context 参数应抛 TypeError")
+
+
+# ---------------------------------------------------------------- ch09：快照与笔记
+
+
+def _agent_with_notes(provider, on_turn_end=None, extra=("", "")):
+    engine, _ = new_engine(tempfile.mkdtemp())
+    return Agent(
+        provider,
+        Registry(),
+        "dev",
+        engine,
+        NullContext(),
+        system_extra=extra,
+        on_turn_end=on_turn_end,
+    )
+
+
+def test_system_extra_used():
+    """两段文本进了 system.stable（假 provider 收到的请求里能查到）。"""
+    provider = FakeProvider([_text_round()])
+    agent = _agent_with_notes(provider, extra=("项目规则X", "记忆索引Y"))
+
+    _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    stable = provider.requests[0].system.stable
+    assert "项目规则X" in stable
+    assert "记忆索引Y" in stable
+    assert stable.index("项目规则X") < stable.index("记忆索引Y")
+
+
+def test_system_stable_same_across_turns():
+    """同一会话两轮：system.stable 逐字节相同（AC29）。
+
+    这条是「快照」的全部意义：如果每轮重读索引，笔记一写文件就会让 stable
+    变形，ch05 的 prompt 缓存整段失效——而且用户完全看不出来。
+    """
+    provider = FakeProvider([_text_round("一"), _text_round("二")])
+    agent = _agent_with_notes(provider, extra=("规则", "索引"))
+    conv = Conversation()
+
+    _collect(agent, "q1", conv, asyncio.Event())
+    _collect(agent, "q2", conv, asyncio.Event())
+
+    assert provider.requests[0].system.stable == provider.requests[1].system.stable
+
+
+def test_on_turn_end_called_on_natural_stop():
+    """自然停下（无工具调用）→ 触发一次笔记任务。"""
+    called = []
+
+    async def hook(conv):
+        called.append(conv)
+
+    provider = FakeProvider([_text_round()])
+    agent = _agent_with_notes(provider, on_turn_end=hook)
+
+    _collect(agent, "hi", Conversation(), asyncio.Event())
+    asyncio.run(agent.drain_note_tasks())
+
+    assert len(called) == 1
+
+
+def test_on_turn_end_not_called_on_tool_turn():
+    """工具轮不触发：那一轮还没有「结论」，提炼出来的是半截推理。"""
+    called = []
+
+    async def hook(conv):
+        called.append(conv)
+
+    provider = FakeProvider(
+        [[StreamEvent(done=True, tool_calls=_tool_calls(["c1"]))], _text_round()]
+    )
+    registry = Registry()
+    registry.register(FakeTool())
+    engine, _ = new_engine(tempfile.mkdtemp())
+    agent = Agent(provider, registry, "dev", engine, NullContext(), on_turn_end=hook)
+
+    _collect(agent, "hi", Conversation(), asyncio.Event())
+    asyncio.run(agent.drain_note_tasks())
+
+    assert len(called) == 1  # 只有最后那轮自然停下触发
+
+
+def test_memory_signal_bypasses_interval(monkeypatch):
+    """间隔设为 5 时，第 2 轮说「记住」仍立即触发。"""
+    import helpcode.agent as agent_mod
+
+    called = []
+
+    async def hook(conv):
+        called.append(conv)
+
+    monkeypatch.setattr(agent_mod, "MEMORY_UPDATE_EVERY", 5)
+    provider = FakeProvider([_text_round("一"), _text_round("二")])
+    agent = _agent_with_notes(provider, on_turn_end=hook)
+    conv = Conversation()
+
+    _collect(agent, "第一个问题", conv, asyncio.Event())  # 第 1 轮：1 % 5 != 0
+    _collect(agent, "记住：以后都跑 ruff", conv, asyncio.Event())
+    asyncio.run(agent.drain_note_tasks())
+
+    assert len(called) == 1
+
+
+def test_note_request_usage_not_counted():
+    """笔记请求不产生第二个 usage 事件：主历史只认自己那一轮的用量（AC24）。
+
+    笔记走的是独立 provider 调用。若把它也算进 `token_usage`，状态栏的
+    上下文占用会莫名其妙地多出一截，用户会以为历史变长了。
+    """
+    seen: list[list] = []
+
+    async def hook(conv):
+        # 模拟笔记请求自己烧了一遍 token —— 它不该出现在主历史的 usage 里
+        seen.append([m.content for m in conv.messages()])
+
+    provider = FakeProvider([_text_round()])
+    agent = _agent_with_notes(provider, on_turn_end=hook)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+    asyncio.run(agent.drain_note_tasks())
+
+    usages = [e.token_usage for e in events if e.token_usage is not None]
+    assert len(usages) == 1  # 只有主请求那一次
+    assert usages[0].input_tokens == 10 and usages[0].output_tokens == 2
+    assert len(seen) == 1  # 笔记任务确实跑了
+
+
+def test_on_turn_end_not_called_on_error_round():
+    """报错轮不触发笔记任务：那一轮没有结论，提炼出来只会是半截推理。
+
+    取消轮同理——`CancelledError` 会一路冒泡出 `run()`，走不到写历史的
+    那个分支。这里锁住报错那条。
+    """
+    called: list = []
+
+    async def hook(conv):
+        called.append(conv)
+
+    provider = FakeProvider([[StreamEvent(err=RuntimeError("boom"))]])
+    agent = _agent_with_notes(provider, on_turn_end=hook)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+    asyncio.run(agent.drain_note_tasks())
+
+    assert any(e.err is not None for e in events)
+    assert called == []

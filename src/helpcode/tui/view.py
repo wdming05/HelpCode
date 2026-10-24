@@ -122,3 +122,50 @@ def render_iteration(n: int) -> Text:
 def render_notice(text: str) -> Text:
     """停止提示块（黄色，区别于错误红色）。"""
     return Text("● " + text, style="bold yellow")
+
+
+# ---------------------------------------------------------------- 会话恢复（ch09）
+
+
+def _ago(seconds: float) -> str:
+    """相对时间：刚 / N 分钟前 / N 小时前 / 昨天 / N 天前。
+
+    用 ID 里的创建时间算，不用文件 mtime——mtime 会被复制、备份、云同步重写。
+    """
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} 分钟前"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} 小时前"
+    days = int(seconds // 86400)
+    if days == 1:
+        return "昨天"
+    return f"{days} 天前"
+
+
+def render_session_option(meta, now: float) -> Text:
+    """会话列表的一行：标题 · 相对时间 · 模型 · 大小 · 条数（AC37）。"""
+    size_kb = meta.size_bytes / 1024
+    line = Text()
+    line.append(meta.title or "（无标题）", style="bold")
+    line.append(f"　{_ago(max(0.0, now - meta.updated))}", style="dim")
+    line.append(f"　{meta.model}", style="cyan")
+    line.append(f"　{size_kb:.1f} KB", style="dim")
+    line.append(f"　{meta.messages} 条", style="dim")
+    return line
+
+
+def render_restored(name: str, messages: int) -> Text:
+    """恢复成功提示行（AC34）。"""
+    return Text(f"已恢复会话 {name}：{messages} 条消息", style="dim")
+
+
+def render_repaired(summary: str) -> Text:
+    """修复汇总行；空串返回空 Text（调用方据此决定写不写）。"""
+    return Text(summary, style="yellow") if summary else Text()
+
+
+def render_cleanup(line: str) -> Text:
+    """清理汇总行；空串返回空 Text。"""
+    return Text(line, style="dim") if line else Text()
