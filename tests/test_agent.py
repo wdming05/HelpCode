@@ -5,6 +5,8 @@ import tempfile
 import threading
 import time
 
+from null_context import NullContext
+
 from helpcode.agent import Agent
 from helpcode.conversation import Conversation
 from helpcode.llm import StreamEvent, TokenUsage, ToolCall
@@ -81,10 +83,14 @@ class FakeProvider:
             yield ev
 
 
+class _NullContext(NullContext):
+    """永不压缩的桩；真正的压缩路径在 test_context_*.py 里。"""
+
+
 def _make_agent(provider, registry):
-    """构造 Agent（四参显式 + 临时目录引擎）。"""
+    """构造 Agent（五参显式 + 临时目录引擎）。"""
     engine, _ = new_engine(tempfile.mkdtemp())
-    return Agent(provider, registry, "dev", engine)
+    return Agent(provider, registry, "dev", engine, _NullContext())
 
 
 def _collect(agent, text, conv, cancel, mode=Mode.DEFAULT):
@@ -480,3 +486,194 @@ def test_agent_readonly_no_approval():
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
     assert not any(e.permission_request is not None for e in events), "只读不应触发 Ask"
+
+
+# ---------------------------------------------------------------- ch08：压缩与撞墙
+
+from helpcode.context import CompressInfo, CompressReport
+from helpcode.llm import ContextLengthExceeded
+
+PTL = ContextLengthExceeded("prompt is too long")
+
+
+class _RetryContext(_NullContext):
+    """可配置的压缩桩：用来验证 agent 侧的撞墙重试分支。"""
+
+    def __init__(self, after=1000, failed="", compress=False, with_info=False):
+        self.compact_calls = 0
+        self.before_calls = 0
+        self._after = after
+        self._failed = failed
+        self._compress = compress
+        self._with_info = with_info
+
+    def estimate(self, conv):
+        return 50_000
+
+    def should_compress(self, conv):
+        return self._compress
+
+    async def before_request(self, conv, cancel_event, tool_names):
+        self.before_calls += 1
+        if not self._with_info:
+            return CompressReport()
+        return CompressReport(
+            info=CompressInfo(
+                phase="done",
+                tokens_before=50_000,
+                tokens_after=1_000,
+                summarized=4,
+                kept=3,
+            )
+        )
+
+    async def compact_now(self, conv, emergency=False, tool_names=None):
+        self.compact_calls += 1
+        return CompressReport(
+            tokens_after=self._after,
+            failed=self._failed,
+            summarized=2,
+            kept=3,
+            notice="已压缩：摘要 2 条 / 保留 3 条",
+        )
+
+    def has_room_after_compress(self, tokens_after):
+        return tokens_after < 100_000
+
+
+def _make_agent_ctx(provider, registry, ctx):
+    engine, _ = new_engine(tempfile.mkdtemp())
+    return Agent(provider, registry, "dev", engine, ctx)
+
+
+def _text_round(text="ok"):
+    return [
+        StreamEvent(text=text),
+        StreamEvent(usage=TokenUsage(input_tokens=10, output_tokens=2)),
+        StreamEvent(done=True),
+    ]
+
+
+def test_compress_events_before_request():
+    provider = FakeProvider([_text_round()])
+    ctx = _RetryContext(compress=True, with_info=True)
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+    compress = [e.compress for e in events if e.compress]
+
+    assert [c.phase for c in compress] == ["start", "done"]
+    assert compress[0].tokens_before == 50_000
+    assert compress[1].tokens_after == 1_000
+    # start 在任何正文之前
+    first_text = next(i for i, e in enumerate(events) if e.text)
+    first_compress = next(i for i, e in enumerate(events) if e.compress)
+    assert first_compress < first_text
+
+
+def test_wall_hit_triggers_emergency_then_retry():
+    provider = FakeProvider([[StreamEvent(err=PTL)], _text_round("救回来了")])
+    ctx = _RetryContext()
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 2
+    assert ctx.compact_calls == 1
+    assert any(e.text == "救回来了" for e in events)
+    phases = [e.compress.phase for e in events if e.compress]
+    assert phases == ["start", "done"]
+
+
+def test_wall_hit_retries_only_once():
+    provider = FakeProvider(
+        [[StreamEvent(err=PTL)], [StreamEvent(err=PTL)], _text_round()]
+    )
+    ctx = _RetryContext()
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 2  # 第二次仍失败 → 不再重试
+    assert any(e.err is PTL for e in events)
+
+
+def test_wall_hit_after_text_does_not_retry():
+    """已经流出文本再撞墙：重试会让同一段话出现两次，必须直接上报。"""
+    provider = FakeProvider([[StreamEvent(text="半句"), StreamEvent(err=PTL)]])
+    ctx = _RetryContext()
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 1
+    assert ctx.compact_calls == 0
+    assert any(e.err is PTL for e in events)
+
+
+def test_wall_hit_when_compact_cannot_help_reports_error():
+    provider = FakeProvider([[StreamEvent(err=PTL)]])
+    ctx = _RetryContext(after=200_000)  # 压完仍贴窗口
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 1
+    assert any(e.err is PTL for e in events)
+
+
+def test_wall_hit_when_compact_failed_reports_error():
+    provider = FakeProvider([[StreamEvent(err=PTL)]])
+    ctx = _RetryContext(failed="摘要输出不可解析")
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 1
+    assert any(e.err is PTL for e in events)
+
+
+def test_non_ptl_error_not_retried():
+    boom = ValueError("rate limit")
+    provider = FakeProvider([[StreamEvent(err=boom)]])
+    ctx = _RetryContext()
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert provider.call_count == 1
+    assert ctx.compact_calls == 0
+    assert any(e.err is boom for e in events)
+
+
+def test_compact_now_delegates():
+    ctx = _RetryContext()
+    agent = _make_agent_ctx(FakeProvider([]), Registry(), ctx)
+
+    report = asyncio.run(agent.compact_now(Conversation()))
+
+    assert ctx.compact_calls == 1
+    assert "已压缩" in report.notice
+
+
+def test_no_compress_event_when_below_threshold():
+    """未触发阈值时事件流里不该有 compress 事件（TUI 不该闪过"正在压缩"）。"""
+    provider = FakeProvider([_text_round()])
+    ctx = _RetryContext(compress=False)
+    agent = _make_agent_ctx(provider, Registry(), ctx)
+
+    events = _collect(agent, "hi", Conversation(), asyncio.Event())
+
+    assert not [e for e in events if e.compress]
+    assert ctx.before_calls == 1
+
+
+def test_agent_requires_context_argument():
+    """不传 context 必须当场 TypeError，而不是跑到一半才发现没压缩。"""
+    engine, _ = new_engine(tempfile.mkdtemp())
+    try:
+        Agent(FakeProvider([]), Registry(), "dev", engine)  # type: ignore[call-arg]
+    except TypeError as e:
+        assert "context" in str(e)
+    else:  # pragma: no cover
+        raise AssertionError("缺少 context 参数应抛 TypeError")

@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.widgets import OptionList, RichLog, Static, TextArea
@@ -10,7 +11,8 @@ from textual.widgets.option_list import Option
 
 from .. import __version__
 from ..agent import Agent
-from ..config import ProviderConfig
+from ..config import DEFAULT_WINDOW, ProviderConfig
+from ..context import ContextManager
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
 from ..permission import Mode, Outcome, new_engine
@@ -92,6 +94,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         self.mcp_tools = mcp_tools or []
         self.state = SessionState.SELECTING
         self.provider: Provider | None = None
+        self.provider_cfg: ProviderConfig | None = None
         self.agent: Agent | None = None
         self.engine = None
         self.conv = Conversation()
@@ -122,6 +125,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         log.write(render_banner(__version__, os.getcwd()))
 
         if len(self.providers) == 1:
+            self.provider_cfg = self.providers[0]
             self.provider = new_provider(self.providers[0])
             self._setup_agent()
             self.state = SessionState.IDLE
@@ -150,7 +154,21 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
         registry = new_default_registry()
         for tool in self.mcp_tools:
             registry.register(tool)
-        self.agent = Agent(self.provider, registry, __version__, self.engine)
+        # 与 self.conv 同生命周期：跨轮持有锚点与熔断状态。
+        # 挂在 Agent 上也等价，但 Agent 一旦被重建（切 provider / 重载工具）
+        # 就会静默丢掉熔断状态，连续失败的摘要会重新烧钱。
+        #
+        # 窗口值取自配置对象而非 provider：provider 只该管"怎么发请求"，
+        # 不该承载业务参数（否则改一个字段就要动协议层）。
+        cfg = self.provider_cfg
+        if cfg is not None and cfg.context_window:
+            window = cfg.context_window
+        else:  # 手工构造的 provider（测试）没有配置对象，按 openai 协议默认
+            window = DEFAULT_WINDOW[cfg.protocol if cfg else "openai"]
+        self.context = ContextManager(self.provider, Path(os.getcwd()), window)
+        self.agent = Agent(
+            self.provider, registry, __version__, self.engine, self.context
+        )
 
     async def submit(self, text: str) -> None:
         """处理一次输入提交。"""
@@ -173,6 +191,12 @@ class HelpCodeApp(StreamMixin, SelectMixin, App):
             self.mode = Mode.DEFAULT
             self._update_statusbar()
             text = EXECUTE_DIRECTIVE  # 注入执行指令，触发模型按计划执行
+        if text == "/compact":
+            log = self.query_one("#log", RichLog)
+            log.write(user_block("/compact"))
+            report = await self.agent.compact_now(self.conv)
+            log.write(report.notice or "无需压缩")
+            return
 
         self.cancel_event = asyncio.Event()  # 每次提交重置取消信号
         log = self.query_one("#log", RichLog)

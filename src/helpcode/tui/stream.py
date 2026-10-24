@@ -8,6 +8,8 @@ from textual.widgets import RichLog, Static
 from . import SessionState
 from .view import (
     error_block,
+    render_compress_done,
+    render_compress_start,
     render_markdown,
     render_notice,
     render_permission_request,
@@ -51,6 +53,14 @@ class StreamMixin:
                     self.query_one("#streaming", Static).update(
                         render_permission_request(ev.permission_request, 0)
                     )
+                if ev.compress is not None:
+                    if ev.compress.phase == "start":
+                        self.query_one("#streaming", Static).update(
+                            render_compress_start(ev.compress)
+                        )
+                    else:
+                        log = self.query_one("#log", RichLog)
+                        log.write(render_compress_done(ev.compress))
                 if ev.notice is not None:
                     log = self.query_one("#log", RichLog)
                     log.write(render_notice(ev.notice))

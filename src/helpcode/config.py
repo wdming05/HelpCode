@@ -1,10 +1,17 @@
 """配置模块：读取并校验 ``.helpcode/config.yaml``。"""
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+# 各协议的默认上下文窗口（token）。显式配置 context_window 可覆盖。
+# 统一按 128K 会让 Anthropic 用户提前 30% 触发压缩，白白丢掉可用的上下文。
+DEFAULT_WINDOW = {"anthropic": 200000, "openai": 128000}
 
 
 class ConfigError(Exception):
@@ -19,6 +26,7 @@ class ProviderConfig:
     model: str  # 状态栏右侧显示
     base_url: str | None = None  # None 则用 SDK 默认端点
     thinking: bool = False  # 仅 anthropic 生效
+    context_window: int = 0  # 0 = 按协议取默认（解析阶段填实）
 
 
 @dataclass
@@ -89,4 +97,24 @@ def _parse_provider(item, index: int) -> ProviderConfig:
         model=str(model).strip(),
         base_url=item.get("base_url") or None,
         thinking=bool(item.get("thinking", False)),
+        context_window=_parse_window(item.get("context_window"), protocol, prefix),
     )
+
+
+def _parse_window(raw, protocol: str, prefix: str) -> int:
+    """解析 context_window；非法值回落协议默认，不抛 ConfigError。
+
+    可选字段不该让程序起不来：一个写错的 token 数，代价顶多是「压缩早触发」，
+    而抛异常会让整个 CLI 无法启动。
+    """
+    default = DEFAULT_WINDOW.get(protocol, 128000)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value > 0:
+        return value
+    logger.warning("%s.context_window 非法（%r），已回落为 %d", prefix, raw, default)
+    return default

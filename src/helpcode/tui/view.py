@@ -98,6 +98,22 @@ def render_token_usage(usage: TokenUsage) -> Text:
     return Text(text + "）", style="dim")
 
 
+def render_compress_start(info) -> Text:
+    """压缩开始（动态区）：先告诉用户正在忙，而不是干等。"""
+    return Text(
+        f"正在压缩上下文…（当前约 {info.tokens_before:,} tokens）", style="dim italic"
+    )
+
+
+def render_compress_done(info) -> Text:
+    """压缩完成（日志行）：带前后 token，用户才能判断这次压缩值不值。"""
+    return Text(
+        f"已压缩：摘要 {info.summarized} 条 / 保留 {info.kept} 条，"
+        f"tokens {info.tokens_before:,} → {info.tokens_after:,}",
+        style="dim",
+    )
+
+
 def render_iteration(n: int) -> Text:
     """迭代轮次展示（流式态动态区）。"""
     return Text(f"第 {n}/25 轮", style="bold")

@@ -6,8 +6,16 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from . import prompt
+from .context import CompressInfo, ContextManager
 from .conversation import Conversation
-from .llm import Provider, Request, System, TokenUsage, ToolCall
+from .llm import (
+    ContextLengthExceeded,
+    Provider,
+    Request,
+    System,
+    TokenUsage,
+    ToolCall,
+)
 from .permission import (
     Decision,
     Engine,
@@ -45,6 +53,7 @@ class AgentEvent:
     iteration: int | None = None  # 当前迭代轮次（进度）
     notice: str | None = None  # 停止提示（非错误）
     permission_request: PermissionRequest | None = None  # 人在回路请求
+    compress: CompressInfo | None = None  # 压缩事件（start / done，带 token）
     done: bool = False  # 本轮（一次 run）结束
     err: Exception | None = None  # LLM 流出错
 
@@ -58,12 +67,19 @@ class Agent:
     PLAN_REMINDER_INTERVAL = 4
 
     def __init__(
-        self, provider: Provider, registry: Registry, version: str, engine: Engine
+        self,
+        provider: Provider,
+        registry: Registry,
+        version: str,
+        engine: Engine,
+        context: ContextManager,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self._version = version
         self.engine = engine
+        # 故意不给默认值：忘记装配就 TypeError，而不是跑到一半才发现没压缩
+        self.context = context
 
     async def run(
         self,
@@ -101,15 +117,80 @@ class Agent:
                 tools = self.registry.export()
                 reminder = ""
 
+            # ch08：恢复段要写当前工具集，所以先算出来
+            tool_names = [t["name"] for t in (tools or [])]
+
+            # ch08：每个请求前估算一次；需要压缩则先发 start 事件（用户立刻有反馈）
+            if self.context.should_compress(conv):
+                yield AgentEvent(
+                    compress=CompressInfo(
+                        phase="start", tokens_before=self.context.estimate(conv)
+                    )
+                )
+
+            report = await self.context.before_request(conv, cancel_event, tool_names)
+            if report.cancelled:
+                yield AgentEvent(notice="已取消")
+                yield AgentEvent(done=True)
+                return
+            if report.notice:
+                yield AgentEvent(notice=report.notice)
+            if report.info is not None:
+                yield AgentEvent(compress=report.info)
+
             # 流式收集：双路（实时 yield + 累积完整文本）
+            # 撞墙（PTL）则紧急压缩后在同一迭代重试一次，不消耗额外迭代预算
             out: dict = {}
-            async for ev in self._stream_once(
-                conv, sys, env_text, tools, reminder, out
-            ):
-                if ev.err is not None:
-                    yield ev
-                    return
-                yield ev
+            emergency_retried = False
+            while True:
+                out = {}
+                hit_wall = False
+                async for ev in self._stream_once(
+                    conv, sys, env_text, tools, reminder, out
+                ):
+                    if ev.err is None:
+                        yield ev
+                        continue
+                    # 三个终止条件顺序不能变：
+                    # 非 PTL 立刻上报 → 已重试过就放弃 → 已吐过字不能重试（会重复）
+                    if (
+                        not isinstance(ev.err, ContextLengthExceeded)
+                        or emergency_retried
+                        or out.get("text")
+                    ):
+                        yield ev
+                        return
+
+                    emergency_retried = True
+                    hit_wall = True
+                    before = self.context.estimate(conv)
+                    yield AgentEvent(
+                        compress=CompressInfo(phase="start", tokens_before=before)
+                    )
+
+                    rep = await self.context.compact_now(
+                        conv, emergency=True, tool_names=tool_names
+                    )
+                    after = rep.tokens_after or self.context.estimate(conv)
+                    yield AgentEvent(
+                        compress=CompressInfo(
+                            phase="done",
+                            tokens_before=before,
+                            tokens_after=after,
+                            summarized=rep.summarized,
+                            kept=rep.kept,
+                            spilled=rep.spilled,
+                        )
+                    )
+
+                    # 压完仍贴着窗口 → 重试必然再撞，直接报错，不烧钱
+                    if rep.failed or not self.context.has_room_after_compress(after):
+                        yield ev
+                        return
+                    break
+                if not hit_wall:
+                    break
+
             text = out.get("text", "")
             tool_calls = out.get("tool_calls")
             usage = out.get("usage")
@@ -176,6 +257,9 @@ class Agent:
         usage = None
         async for ev in self.provider.stream(req):
             if ev.err is not None:
+                # ★ 出错也要交出已累积的文本：上层靠它判断「是否已经吐过字」，
+                #   吐过就不能重试（重试会让同一段话出现两次）。
+                out["text"] = text
                 yield AgentEvent(err=ev.err)
                 return
             if ev.text:
@@ -189,6 +273,15 @@ class Agent:
         out["text"] = text
         out["tool_calls"] = tool_calls
         out["usage"] = usage
+        # ch08：用服务端实测值重建锚点（含 cache_read/cache_write，见 D10）
+        if usage is not None:
+            self.context.after_stream(usage, len(conv.messages()))
+
+    async def compact_now(self, conv: Conversation, emergency: bool = False):
+        """手动 / 紧急压缩（TUI 的 /compact 与撞墙重试都走这里）。"""
+        return await self.context.compact_now(
+            conv, emergency=emergency, tool_names=self.registry.names()
+        )
 
     async def _execute_calls(
         self,

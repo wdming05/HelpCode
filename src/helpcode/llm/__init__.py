@@ -6,6 +6,10 @@ from typing import Literal, Protocol
 
 from ..config import ProviderConfig
 from ..tool import ToolResult
+from .errors import (
+    ContextLengthExceeded as ContextLengthExceeded,  # 显式 re-export，供 agent 使用
+)
+from .errors import is_context_too_long as is_context_too_long
 
 
 @dataclass

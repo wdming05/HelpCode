@@ -93,3 +93,46 @@ def test_empty_providers(tmp_path):
 def test_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="配置文件不存在"):
         load(str(tmp_path / "nope.yaml"))
+
+
+def _write(tmp_path, providers):
+    import yaml
+
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        yaml.safe_dump({"providers": providers}, allow_unicode=True), encoding="utf-8"
+    )
+    return str(p)
+
+
+def _base(**kw):
+    d = {"name": "p", "protocol": "openai", "api_key": "k", "model": "m"}
+    d.update(kw)
+    return d
+
+
+def test_context_window_explicit(tmp_path):
+    cfg = load(_write(tmp_path, [_base(context_window=64000)]))
+    assert cfg.providers[0].context_window == 64000
+
+
+def test_context_window_default_openai_is_128k(tmp_path):
+    cfg = load(_write(tmp_path, [_base()]))
+    assert cfg.providers[0].context_window == 128000
+
+
+def test_context_window_default_anthropic_is_200k(tmp_path):
+    cfg = load(_write(tmp_path, [_base(protocol="anthropic")]))
+    assert cfg.providers[0].context_window == 200000
+
+
+def test_context_window_invalid_falls_back(tmp_path):
+    for bad in ("abc", 0, -1):
+        cfg = load(_write(tmp_path, [_base(context_window=bad)]))
+        assert cfg.providers[0].context_window == 128000
+
+
+def test_context_window_invalid_does_not_raise(tmp_path):
+    """可选字段写错不该让整个 CLI 起不来。"""
+    cfg = load(_write(tmp_path, [_base(context_window="???")]))
+    assert len(cfg.providers) == 1

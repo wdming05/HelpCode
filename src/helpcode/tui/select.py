@@ -28,6 +28,7 @@ class SelectMixin:
     def on_option_list_option_selected(self, event) -> None:
         """用户选定一个 provider 后进入对话。"""
         cfg = self.providers[event.option_index]
+        self.provider_cfg = cfg
         self.provider = new_provider(cfg)
         self._setup_agent()
         self._update_statusbar()

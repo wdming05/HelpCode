@@ -23,3 +23,5 @@ _archive_v1_tools/
 ch03-*.md
 ch04-*.md
 ch05-*.md
+# 上下文压缩的落盘文件
+.helpcode/tool-results/

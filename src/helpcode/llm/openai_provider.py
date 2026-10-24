@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from ..config import ProviderConfig
 from . import Request, StreamEvent, TokenUsage, ToolCall
+from .errors import ContextLengthExceeded, is_context_too_long
 
 
 def _to_openai_messages(req: Request) -> list[dict]:
@@ -142,4 +143,8 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            yield StreamEvent(err=e)
+            # 上下文超限是可恢复的：包成哨兵，让 agent 走「紧急压缩 → 重试」。
+            # 其余异常原样投递，行为与引入 ch08 之前完全一致。
+            yield StreamEvent(
+                err=ContextLengthExceeded(str(e)) if is_context_too_long(e) else e
+            )
