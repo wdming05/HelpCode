@@ -4,6 +4,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from .command import DuplicateCommandError, build_default_registry
 from .config import Config, ConfigError, load
 from .mcp import McpManager, load_mcp_config
 from .memory import cleanup as cleanup_mod
@@ -11,6 +12,15 @@ from .memory import index as index_mod
 from .memory import instructions as instructions_mod
 from .memory import session as session_mod
 from .memory.restore import restore as restore_session
+from .skill import (
+    LOAD_SKILL_TOOL,
+    SkillManager,
+    WhitelistError,
+    load_skills,
+    register_skill_commands,
+    validate_whitelists,
+)
+from .tool import new_default_registry
 from .tui.app import HelpCodeApp
 
 CONFIG_PATH = ".helpcode/config.yaml"
@@ -22,6 +32,13 @@ def main() -> None:
         cfg = load(CONFIG_PATH)
     except ConfigError as e:
         print(f"配置错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 命令注册表在启动期构造；别名冲突在这里就终止，不等到运行时。
+    try:
+        build_default_registry()
+    except DuplicateCommandError as e:
+        print(f"命令注册失败: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -67,6 +84,27 @@ async def _run(cfg: Config) -> None:
     manager = McpManager(load_mcp_config(root))
     mcp_tools = await manager.connect_all()
     try:
+        # 5) ch11：加载 Skill + 校验白名单 + 装配命令（连 MCP 后才能知道全部工具名）
+        skill_registry = load_skills(root, home)
+        for warning in skill_registry.warnings:
+            print(f"（Skill 提示）{warning}", file=sys.stderr)
+        try:
+            validate_whitelists(
+                skill_registry,
+                set(new_default_registry().names())
+                | {t.name for t in mcp_tools}
+                | {LOAD_SKILL_TOOL},
+            )
+        except WhitelistError as e:
+            print(f"Skill 配置错误: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        skill_manager = SkillManager(
+            skill_registry, reload_fn=lambda: load_skills(root, home)
+        )
+        commands = build_default_registry()
+        register_skill_commands(commands, skill_manager)
+
         app = HelpCodeApp(
             cfg.providers,
             mcp_tools,
@@ -78,6 +116,10 @@ async def _run(cfg: Config) -> None:
             cleanup=cleanup_report,
             sessions=sessions,
             session_id=session_id,
+            commands=commands,
+            instruction_set=instruction_set,
+            index_bundle=bundle,
+            skill_manager=skill_manager,
         )
         await app.run_async()
     finally:

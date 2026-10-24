@@ -63,18 +63,25 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
-    """三个可选槽，默认全空、装配时跳过。
+def optional_modules(
+    instructions: str = "",
+    memory: str = "",
+    active_skills: str = "",
+    available_skills: str = "",
+) -> list[Module]:
+    """四个可选槽，默认全空、装配时跳过。
 
     - ``instructions``（80）：项目指令文件的内容，规则类，排在记忆之前
-    - 已激活 Skill（90）：仍留空，ch07 之后的事
+    - ``available_skills``（85）：可用 Skill 的「名字 + 一句话说明」目录（阶段一）
+    - ``active_skills``（90）：已激活 Skill 的完整 SOP（阶段二，ch11 填上）
     - ``memory``（100）：记忆索引，参考类，排在最后（最靠近对话）
 
     都为空时装配结果与 ch05 **逐字节相同**（AC8）——默认参数保证了这一点。
     """
     return [
         Module(name="自定义指令", priority=80, content=instructions),
-        Module(name="已激活 Skill", priority=90, content=""),
+        Module(name="可用 Skill", priority=85, content=available_skills),
+        Module(name="已激活 Skill", priority=90, content=active_skills),
         Module(name="长期记忆", priority=100, content=memory),
     ]
 

@@ -83,6 +83,7 @@ class Agent:
         context: ContextManager,
         system_extra: tuple[str, str] = ("", ""),
         on_turn_end=None,
+        skills=None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -93,6 +94,9 @@ class Agent:
         # （指令, 记忆索引）的**快照**：在构造时定下，整个会话不变。
         # 若每轮重读，笔记一写文件 stable 就变，ch05 的 prompt 缓存整段失效。
         self._system_extra = system_extra
+        # Skill 管理器（鸭子类型）：提供 render_available()/render_active()/
+        # allowed_tools() 三个方法。测试不传即空行为，agent 不 import skill。
+        self._skills = skills
         self._on_turn_end = on_turn_end
         self._note_tasks: set[asyncio.Task] = set()
         self._turn_count = 0
@@ -109,8 +113,23 @@ class Agent:
 
         # ch05：采集环境 + 装配稳定 system（一次，循环外）
         env = await prompt.gather_environment(self._version, self.provider.model)
-        sys = prompt.build_system_prompt(*self._system_extra)
+        # ch11：已激活 Skill 每轮从管理器现读——激活状态会随 load_skill 变化，
+        # 不能像指令/记忆那样在构造时快照。
+        if self._skills is not None:
+            active_skills = self._skills.render_active()
+            available_skills = self._skills.render_available()
+        else:
+            active_skills = available_skills = ""
+        sys = prompt.build_system_prompt(
+            self._system_extra[0],
+            self._system_extra[1],
+            active_skills,
+            available_skills,
+        )
         env_text = env.render()
+
+        # ch11：白名单收窄——有 Skill 激活时只露出白名单并集（恒含 load_skill）。
+        allowed = self._skills.allowed_tools() if self._skills is not None else None
 
         for iteration in range(1, self.MAX_ITERATIONS + 1):
             # 终止优先级：取消最高（协作式，每轮开头检查）
@@ -132,6 +151,10 @@ class Agent:
             else:
                 tools = self.registry.export()
                 reminder = ""
+
+            # 白名单软过滤：不删 registry（授权仍走权限引擎），只收窄模型可见工具
+            if allowed is not None:
+                tools = [t for t in tools if t["name"] in allowed]
 
             # ch08：恢复段要写当前工具集，所以先算出来
             tool_names = [t["name"] for t in (tools or [])]

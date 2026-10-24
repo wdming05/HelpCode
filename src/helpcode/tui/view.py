@@ -34,13 +34,18 @@ _MODE_STYLE = {
 }
 
 
+def mode_mark(mode: Mode) -> str:
+    """权限模式的状态栏标记，如 ``[PLAN]``。"""
+    return f"[{mode.name}]"
+
+
 def render_statusbar(mode: Mode, model: str) -> Table:
-    """状态栏：左权限模式名（配色）、右模型名，两端对齐。"""
+    """状态栏：左权限模式标记（如 [PLAN]）、右模型名，两端对齐。"""
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1, justify="left")
     grid.add_column(ratio=1, justify="right")
     style = _MODE_STYLE.get(mode, "")
-    grid.add_row(Text(str(mode), style=f"bold {style}"), Text(model))
+    grid.add_row(Text(mode_mark(mode), style=f"bold {style}"), Text(model))
     return grid
 
 

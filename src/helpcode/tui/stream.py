@@ -45,6 +45,7 @@ class StreamMixin:
                     log.write(render_tool_end(ev.tool_call, ev.tool_end))
                 if ev.token_usage is not None:
                     usage = ev.token_usage
+                    self.last_usage = ev.token_usage  # 供 /status 读取
                 if ev.permission_request is not None:
                     self._pending_request = ev.permission_request
                     self._approve_cursor = 0

@@ -11,6 +11,13 @@ from textual.widgets.option_list import Option
 
 from .. import __version__
 from ..agent import Agent
+from ..command import (
+    CommandContext,
+    DuplicateCommandError,
+    ParsedCommand,
+    build_default_registry,
+    parse,
+)
 from ..config import DEFAULT_WINDOW, ProviderConfig
 from ..context import ContextManager
 from ..conversation import Conversation
@@ -18,14 +25,18 @@ from ..llm import Provider, new_provider
 from ..memory import notes
 from ..memory.session import tool_results_dir
 from ..permission import Mode, Outcome, new_engine
-from ..prompt import EXECUTE_DIRECTIVE, render_banner
+from ..prompt import render_banner
+from ..skill import SkillTool, make_skill_command, substitute
+from ..skill.types import ExecutionMode
 from ..tool import new_default_registry
 from . import SessionState
+from .host import TextualHost
 from .resume import ResumeMixin
 from .select import SelectMixin
 from .stream import StreamMixin
 from .view import (
     render_cleanup,
+    render_notice,
     render_permission_request,
     render_repaired,
     render_restored,
@@ -43,13 +54,20 @@ class InputArea(TextArea):
         self.border_subtitle = "Send a message..."
 
     async def _on_key(self, event) -> None:
-        """拦截 Enter（提交）与 Alt+Enter（换行），其余交给 TextArea 默认处理。"""
+        """拦截 Enter（提交）、Tab（补全）与 Alt+Enter（换行）。"""
         key = event.key
         if key == "enter":
             event.stop()
             event.prevent_default()
             self.action_submit_input()
             return
+        if key == "tab":
+            app = self.app
+            if isinstance(app, HelpCodeApp):
+                event.stop()
+                event.prevent_default()
+                app.handle_tab()
+                return
         if key == "alt+enter":
             event.stop()
             event.prevent_default()
@@ -109,6 +127,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         cleanup=None,
         sessions: list | None = None,
         session_id: str | None = None,
+        commands=None,
+        instruction_set=None,
+        index_bundle=None,
+        skill_manager=None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -129,6 +151,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         # 快照：整个会话不变，改笔记文件不会让 stable 变形（N1）
         self._instructions = instructions
         self._memory = memory
+        # 命令系统：注册表 + /memory 需要的原始加载结果
+        self.commands = commands
+        self._instruction_set = instruction_set
+        self._index_bundle = index_bundle
+        # Skill 系统：管理器（激活集合 / 渲染 / 白名单）
+        self.skill_manager = skill_manager
+        self.last_usage = None  # 最近一次请求的 token 用量（/status 用）
         self.cancel_event = asyncio.Event()
         self.mode = Mode.DEFAULT
         self.cur_reply = ""
@@ -154,6 +183,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         # 选会话用的两个控件：默认隐藏，/resume 时显示
         yield Input(id="resume_filter", placeholder="输入关键字过滤会话…")
         yield OptionList(id="resume_list")
+        # Tab 补全用的候选菜单：默认隐藏
+        yield OptionList(id="command_list")
 
     def on_mount(self) -> None:
         """启动：写 banner 与恢复/清理提示；单 provider 直进 IDLE，多 provider 进 SELECTING。"""
@@ -176,6 +207,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         # 选会话组件默认隐藏
         self.query_one("#resume_filter", Input).display = False
         self.query_one("#resume_list", OptionList).display = False
+        self.query_one("#command_list", OptionList).display = False
 
         if len(self.providers) == 1:
             self.provider_cfg = self.providers[0]
@@ -197,41 +229,58 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             render_statusbar(self.mode, self.provider.model)
         )
 
-    def _setup_agent(self) -> None:
-        """provider 确定后，构造权限引擎与 Agent。
-
-        注册顺序固定：内置 6 个在前，MCP 工具在后（已按 server/name 排序）。
-        tools 段位于 system 之前，顺序一变 prompt 缓存前缀就全失效。
-        """
-        self.engine, _ = new_engine(os.getcwd())
+    def _build_registry(self):
+        """构造工具注册中心：内置 6 个 + MCP + load_skill（若装配了 Skill）。"""
         registry = new_default_registry()
         for tool in self.mcp_tools:
             registry.register(tool)
+        if self.skill_manager is not None:
+            registry.register(
+                SkillTool(self.skill_manager, self._register_skill_command)
+            )
+        return registry
+
+    def _context_window(self) -> int:
+        """窗口值取自配置对象而非 provider：provider 只该管「怎么发请求」。"""
+        cfg = self.provider_cfg
+        if cfg is not None and cfg.context_window:
+            return cfg.context_window
+        return DEFAULT_WINDOW[cfg.protocol if cfg else "openai"]
+
+    def _build_context(self) -> ContextManager:
+        return ContextManager(
+            self.provider,
+            Path(os.getcwd()),
+            self._context_window(),
+            spill_subdir=tool_results_dir(Path(os.getcwd()), self.session_id),
+        )
+
+    def _build_agent(self, on_turn_end, context: ContextManager | None = None):
+        """构造一个 Agent；不共享 ContextManager（独立对话要有独立锚点）。"""
+        return Agent(
+            self.provider,
+            self._build_registry(),
+            __version__,
+            self.engine,
+            context if context is not None else self._build_context(),
+            system_extra=(self._instructions, self._memory),
+            on_turn_end=on_turn_end,
+            skills=self.skill_manager,
+        )
+
+    def _setup_agent(self) -> None:
+        """provider 确定后，构造权限引擎与 Agent。
+
+        注册顺序固定：内置 6 个在前，MCP 工具在后（已按 server/name 排序），
+        load_skill 最后。tools 段位于 system 之前，顺序一变 prompt 缓存前缀就全失效。
+        """
+        self.engine, _ = new_engine(os.getcwd())
         # 与 self.conv 同生命周期：跨轮持有锚点与熔断状态。
         # 挂在 Agent 上也等价，但 Agent 一旦被重建（切 provider / 重载工具）
         # 就会静默丢掉熔断状态，连续失败的摘要会重新烧钱。
-        #
-        # 窗口值取自配置对象而非 provider：provider 只该管"怎么发请求"，
-        # 不该承载业务参数（否则改一个字段就要动协议层）。
-        cfg = self.provider_cfg
-        if cfg is not None and cfg.context_window:
-            window = cfg.context_window
-        else:  # 手工构造的 provider（测试）没有配置对象，按 openai 协议默认
-            window = DEFAULT_WINDOW[cfg.protocol if cfg else "openai"]
-        self.context = ContextManager(
-            self.provider,
-            Path(os.getcwd()),
-            window,
-            spill_subdir=tool_results_dir(Path(os.getcwd()), self.session_id),
-        )
-        self.agent = Agent(
-            self.provider,
-            registry,
-            __version__,
-            self.engine,
-            self.context,
-            system_extra=(self._instructions, self._memory),
-            on_turn_end=self._note_hook,
+        self.context = self._build_context()
+        self.agent = self._build_agent(
+            on_turn_end=self._note_hook, context=self.context
         )
 
         # AC41：新建会话时 writer 是在 cli 里建的，那时还没选 provider，model 是空串。
@@ -293,6 +342,64 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             log = self.query_one("#log", RichLog)
             log.write(f"（笔记更新跳过：{exc.__class__.__name__}）")
 
+    # ------------------------------------------------------------ Skill
+
+    def _register_skill_command(self, skill) -> None:
+        """Skill 激活后注册斜杠短命令；与内置/已注册命令撞名则跳过并提示。"""
+        if self.commands is None:
+            return
+        try:
+            self.commands.register(make_skill_command(skill))
+        except DuplicateCommandError:
+            self.query_one("#log", RichLog).write(
+                render_notice(
+                    f"/{skill.name} 与已有命令冲突，未注册短命令"
+                    f"（仍可用 load_skill 加载）"
+                )
+            )
+
+    async def _run_skill(self, name: str, args: str) -> str:
+        """按 Skill 执行模式跑：shared 送对话，isolated 独立跑完回流摘要。"""
+        if self.skill_manager is None:
+            return f"未找到 Skill：{name}"
+        skill = self.skill_manager.get(name)
+        if skill is None:
+            return f"未找到 Skill：{name}（输入 /skills 查看可用 Skill）"
+        self.skill_manager.activate(skill.name)
+        self._register_skill_command(skill)
+        if skill.mode is ExecutionMode.SHARED:
+            await self.send_to_ai(substitute(skill.body, args))
+            return ""
+        return await self._run_skill_isolated(skill, args)
+
+    async def _run_skill_isolated(self, skill, args: str) -> str:
+        """独立对话跑完 Skill，把摘要回流主历史；期间锁住输入。"""
+        self.state = SessionState.STREAMING
+        try:
+            seed = _seed_messages(self.conv.messages(), skill.history)
+            iso = Conversation.from_messages(seed)
+            # 独立 Agent：不共享 ContextManager（锚点隔离），不触发笔记（on_turn_end=None）
+            iso_agent = self._build_agent(on_turn_end=None)
+            text = ""
+            async for ev in iso_agent.run(
+                substitute(skill.body, args),
+                iso,
+                asyncio.Event(),
+                Mode.DEFAULT,
+            ):
+                if ev.err is not None:
+                    text = f"（执行出错：{ev.err.__class__.__name__}）"
+                    break
+                if ev.text:
+                    text += ev.text
+                if ev.done:
+                    break
+            summary = _last_assistant(iso) or text or "（无输出）"
+            self.conv.add_assistant(f"[Skill: {skill.name}]\n{summary}")
+            return f"[Skill: {skill.name}] 完成\n{summary}"
+        finally:
+            self.state = SessionState.IDLE
+
     def _apply_resume(self, meta) -> None:
         """切换到选中的会话：历史、存档、落盘目录三者一起换。"""
         from ..memory.restore import restore as restore_session
@@ -323,42 +430,43 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             self.writer.append_all(msgs)
 
     async def submit(self, text: str) -> None:
-        """处理一次输入提交。"""
+        """处理一次输入提交：命令走本地分发，否则送进 AI。"""
         if self.state != SessionState.IDLE:
             return  # 流式/待批准/选择期间不接受新的提交
         text = text.strip()
         if not text:
             return
-        if text == "/exit":
-            await self.action_quit()
-            return
 
-        # AC16：恢复后那次压缩必须先落地。放在 `/exit` 之后、所有真正用到历史的
-        # 分支之前——`/compact`、`/resume`、普通提问都会读 `self.conv`。
+        # AC16：恢复后那次压缩必须先落地，命令与普通提问都会读历史。
         await self._await_restore_compress()
 
-        if text == "/plan":
-            self.mode = Mode.PLAN
-            self._update_statusbar()
-            log = self.query_one("#log", RichLog)
-            log.write(user_block("/plan"))
-            log.write("已进入计划模式（仅只读工具，可 /do 切换回执行）")
+        parsed = parse(text)
+        if parsed is None:
+            await self.send_to_ai(text)
             return
-        if text == "/do":
-            self.mode = Mode.DEFAULT
-            self._update_statusbar()
-            text = EXECUTE_DIRECTIVE  # 注入执行指令，触发模型按计划执行
-        if text == "/compact":
-            log = self.query_one("#log", RichLog)
-            log.write(user_block("/compact"))
-            report = await self.agent.compact_now(self.conv)
-            log.write(report.notice or "无需压缩")
-            return
-        if text == "/resume":
-            self.query_one("#log", RichLog).write(user_block("/resume"))
-            self._enter_resume()
-            return
+        await self.dispatch_command(parsed)
 
+    async def dispatch_command(self, parsed: ParsedCommand) -> None:
+        """把解析结果分发给命令；未命中或命令抛错都不进 AI、不崩溃。"""
+        registry = self.commands
+        if registry is None:
+            registry = build_default_registry()
+        cmd = registry.resolve(parsed.name)
+        log = self.query_one("#log", RichLog)
+        if cmd is None:
+            log.write(
+                render_notice(f"未知命令 /{parsed.name}，输入 /help 查看全部命令")
+            )
+            return
+        try:
+            await cmd.handler(
+                CommandContext(cmd, parsed.args, TextualHost(self), registry)
+            )
+        except Exception as exc:
+            log.write(render_notice(f"/{cmd.name} 执行失败：{exc.__class__.__name__}"))
+
+    async def send_to_ai(self, text: str) -> None:
+        """把一条用户消息送进对话循环（非命令路径的唯一入口）。"""
         self.cancel_event = asyncio.Event()  # 每次提交重置取消信号
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
@@ -369,6 +477,72 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self.state = SessionState.STREAMING
         self._stream_task = asyncio.create_task(self._consume_stream(text))
         self._timer = self.set_interval(0.1, self._tick)
+
+    async def start_new_session(self) -> str | None:
+        """`/clear`：新建会话目录与存档，重建 Agent 让落盘指向新目录。"""
+        from ..memory import session as session_mod
+
+        # F14：清空对话顺带清掉已激活的 Skill（SOP 不再钉入）
+        if self.skill_manager is not None:
+            self.skill_manager.clear()
+
+        try:
+            sid = session_mod.new_session_id()
+            session_mod.ensure_session_dir(Path(os.getcwd()), sid)
+        except OSError:
+            return None
+        jsonl = session_mod.jsonl_path(Path(os.getcwd()), sid)
+        self.session_id = sid
+        self.writer = _open_writer(jsonl, self.provider.model if self.provider else "")
+        self.conv = Conversation(
+            on_append=self._writer_append,
+            on_replace=self._writer_replace,
+        )
+        if self.provider is not None:
+            self._setup_agent()  # 重建 ContextManager，spill 指向新会话目录
+        return sid
+
+    def handle_tab(self) -> None:
+        """输入框按 Tab：命令补全；非斜杠输入不劫持。"""
+        registry = self.commands or build_default_registry()
+        input_widget = self.query_one("#input", InputArea)
+        text = input_widget.text
+        if not text.startswith("/"):
+            return
+        candidates = registry.complete(text)
+        log = self.query_one("#log", RichLog)
+        if not candidates:
+            log.write(render_notice("没有匹配的命令，输入 /help 查看全部"))
+            return
+        if len(candidates) == 1:
+            input_widget.text = candidates[0] + " "
+            input_widget.move_cursor((0, len(input_widget.text)))
+            return
+        self._show_command_menu(candidates)
+
+    def _show_command_menu(self, candidates: list[str]) -> None:
+        """多匹配：弹出候选菜单。"""
+        menu = self.query_one("#command_list", OptionList)
+        menu.clear_options()
+        menu.add_options([Option(c) for c in candidates])
+        menu.display = True
+        self.state = SessionState.COMPLETING
+        menu.focus()
+
+    def _select_command(self, option_index: int) -> None:
+        """菜单里选中一条命令 → 填入输入框并回 IDLE。"""
+        menu = self.query_one("#command_list", OptionList)
+        choice = menu.get_option_at_index(option_index)
+        input_widget = self.query_one("#input", InputArea)
+        if choice is not None:
+            input_widget.text = str(choice.prompt) + " "
+            input_widget.move_cursor((0, len(input_widget.text)))
+        self._close_command_menu()
+
+    def _close_command_menu(self) -> None:
+        self.query_one("#command_list", OptionList).display = False
+        self.state = SessionState.IDLE
+        self.query_one("#input", InputArea).focus()
 
     def action_cycle_mode(self) -> None:
         """Shift+Tab：循环切换权限模式（仅 IDLE 生效）。"""
@@ -431,9 +605,12 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self.query_one("#input", InputArea).focus()
 
     async def action_cancel(self) -> None:
-        """Esc：选会话/流式/待批准态各自取消当前动作（不退出程序）。"""
+        """Esc：选会话/补全/流式/待批准态各自取消当前动作（不退出程序）。"""
         if self.state == SessionState.RESUMING:
             self._exit_resume()
+            return
+        if self.state == SessionState.COMPLETING:
+            self._close_command_menu()
             return
         if self.state == SessionState.APPROVING:
             # 先 resolve future 解开 agent 等待，再置取消信号
@@ -463,9 +640,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             self.exit()
 
     def on_option_list_option_selected(self, event) -> None:
-        """两个 OptionList 共用一个事件：按 id 分派。"""
-        if getattr(event.option_list, "id", None) == "resume_list":
+        """三个 OptionList 共用一个事件：按 id 分派。"""
+        oid = getattr(event.option_list, "id", None)
+        if oid == "resume_list":
             self._select_session(event.option_index)
+            return
+        if oid == "command_list":
+            self._select_command(event.option_index)
             return
         # 否则是 provider 选择（沿用 SelectMixin 的行为）
         super().on_option_list_option_selected(event)
@@ -479,3 +660,23 @@ def _open_writer(jsonl: Path, model: str):
     from ..memory.session import SessionWriter
 
     return SessionWriter(jsonl, model)
+
+
+def _seed_messages(messages, n: int) -> list:
+    """独立对话的种子：只带 user/assistant 有正文的消息，最多 n 条。
+
+    tool 消息不能带：它们的 tool_call_id 指向的调用不在种子历史里，孤儿化会
+    触发协议错误。assistant 里纯工具请求（content 为空）同理要排除。
+    """
+    if n <= 0:
+        return []
+    keep = [m for m in messages if m.role in ("user", "assistant") and m.content]
+    return keep[-n:]
+
+
+def _last_assistant(conv: Conversation) -> str:
+    """独立对话的最后一条 assistant 正文，作为回流摘要。"""
+    for m in reversed(conv.messages()):
+        if m.role == "assistant" and m.content:
+            return m.content
+    return ""
