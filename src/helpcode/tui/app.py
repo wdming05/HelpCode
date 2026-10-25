@@ -10,7 +10,7 @@ from textual.widgets import Input, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .. import __version__
-from ..agent import Agent
+from ..agent import Agent, PermissionRequest
 from ..command import (
     CommandContext,
     DuplicateCommandError,
@@ -21,13 +21,23 @@ from ..command import (
 from ..config import DEFAULT_WINDOW, ProviderConfig
 from ..context import ContextManager
 from ..conversation import Conversation
+from ..hook.events import HookEvent
 from ..llm import Provider, new_provider
 from ..memory import notes
 from ..memory.session import tool_results_dir
-from ..permission import Mode, Outcome, new_engine
+from ..permission import Mode, Outcome, friendly_name, new_engine
 from ..prompt import render_banner
 from ..skill import SkillTool, make_skill_command, substitute
 from ..skill.types import ExecutionMode
+from ..subagent import (
+    AgentTool,
+    ParentContext,
+    SubAgentRunner,
+    TaskGetTool,
+    TaskListTool,
+    TaskManager,
+    TaskStopTool,
+)
 from ..tool import new_default_registry
 from . import SessionState
 from .host import TextualHost
@@ -131,6 +141,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         instruction_set=None,
         index_bundle=None,
         skill_manager=None,
+        hooks=None,
+        catalog=None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -157,6 +169,14 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self._index_bundle = index_bundle
         # Skill 系统：管理器（激活集合 / 渲染 / 白名单）
         self.skill_manager = skill_manager
+        # Hook 系统：生命周期引擎（Session 级与 UserPromptSubmit 由本类触发）
+        self.hooks = hooks
+        # ch13：角色目录 + 后台任务 + 子 Agent 运行器（_setup_agent 里装配）
+        self.catalog = catalog
+        self.task_manager: TaskManager | None = None
+        self.subagent_runner: SubAgentRunner | None = None
+        # 后台任务完成通知，下一次发送前拼进用户消息
+        self._pending_notices: list[str] = []
         self.last_usage = None  # 最近一次请求的 token 用量（/status 用）
         self.cancel_event = asyncio.Event()
         self.mode = Mode.DEFAULT
@@ -221,6 +241,15 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             )
             self._enter_selecting()
 
+        # ch12：会话开始（首条 user 消息之前）。on_mount 是同步的，异步触发。
+        if self.hooks is not None:
+            asyncio.create_task(
+                self._fire_hook(
+                    HookEvent.SESSION_START,
+                    {"session_id": self.session_id or "", "cwd": os.getcwd()},
+                )
+            )
+
     def _update_statusbar(self) -> None:
         """更新底部状态栏：左权限模式名、右模型名。"""
         if self.provider is None:
@@ -229,8 +258,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             render_statusbar(self.mode, self.provider.model)
         )
 
-    def _build_registry(self):
-        """构造工具注册中心：内置 6 个 + MCP + load_skill（若装配了 Skill）。"""
+    def _base_registry(self):
+        """基础工具池：内置 6 个 + MCP + load_skill + 任务工具（不含 Agent 工具）。"""
         registry = new_default_registry()
         for tool in self.mcp_tools:
             registry.register(tool)
@@ -238,6 +267,17 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             registry.register(
                 SkillTool(self.skill_manager, self._register_skill_command)
             )
+        if self.task_manager is not None:
+            registry.register(TaskListTool(self.task_manager))
+            registry.register(TaskGetTool(self.task_manager))
+            registry.register(TaskStopTool(self.task_manager))
+        return registry
+
+    def _build_registry(self):
+        """主 Agent 的工具池 = 基础工具池 + Agent 工具。"""
+        registry = self._base_registry()
+        if self.subagent_runner is not None:
+            registry.register(AgentTool(self.subagent_runner))
         return registry
 
     def _context_window(self) -> int:
@@ -266,7 +306,68 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             system_extra=(self._instructions, self._memory),
             on_turn_end=on_turn_end,
             skills=self.skill_manager,
+            hooks=self.hooks,
         )
+
+    async def _fire_hook(self, event: HookEvent, payload: dict):
+        """触发 Hook；没装配引擎时返回 None。"""
+        if self.hooks is None:
+            return None
+        return await self.hooks.dispatch(event, payload)
+
+    def _parent_context(self) -> ParentContext:
+        """把父侧能力打包给子 Agent 运行器。"""
+        return ParentContext(
+            provider=self.provider,
+            provider_cfg=self.provider_cfg,
+            engine=self.engine,
+            hooks=self.hooks,
+            version=__version__,
+            registry_factory=self._base_registry,
+            context_factory=self._build_context,
+            conv_getter=lambda: self.conv,
+            approval_handler=self._subagent_approval,
+        )
+
+    def _on_task_done(self, task) -> None:
+        """后台任务完成：攒一条通知，下一次发送前注入主对话。"""
+        notice = (
+            "<task-notification>\n"
+            f"后台任务 {task.id}（{task.name or '子 Agent'}）状态：{task.status}\n"
+            f"结果：{task.result[:500]}\n"
+            "</task-notification>"
+        )
+        self._pending_notices.append(notice)
+        try:
+            self.query_one("#log", RichLog).write(
+                render_notice(f"后台任务 {task.id} {task.status}：{task.result[:60]}")
+            )
+        except Exception:
+            self.log.debug("写后台任务日志失败", exc_info=True)
+
+    async def _subagent_approval(self, call, reason) -> Outcome:
+        """子 Agent 的 Ask 升级到主 TUI：复用 APPROVING 弹窗，返回用户选择。"""
+        future = asyncio.get_event_loop().create_future()
+        request = PermissionRequest(
+            tool_call=call,
+            friendly_name=friendly_name(call.name),
+            preview=_preview_args(call.input),
+            reason=f"[来自 SubAgent] {reason}",
+            respond=future,
+        )
+        prev_state = self.state
+        self._pending_request = request
+        self._approve_cursor = 0
+        self.state = SessionState.APPROVING
+        self.set_focus(None)
+        self.query_one("#streaming", Static).update(
+            render_permission_request(request, 0)
+        )
+        try:
+            return await future
+        finally:
+            self._pending_request = None
+            self.state = prev_state
 
     def _setup_agent(self) -> None:
         """provider 确定后，构造权限引擎与 Agent。
@@ -279,6 +380,15 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         # 挂在 Agent 上也等价，但 Agent 一旦被重建（切 provider / 重载工具）
         # 就会静默丢掉熔断状态，连续失败的摘要会重新烧钱。
         self.context = self._build_context()
+
+        # ch13：后台任务表 + 子 Agent 运行器（必须在 _build_agent 之前，工具池要用）
+        self.task_manager = TaskManager(on_done=self._on_task_done)
+        self.subagent_runner = None
+        if self.catalog is not None:
+            self.subagent_runner = SubAgentRunner(
+                self.catalog, self.task_manager, self._parent_context()
+            )
+
         self.agent = self._build_agent(
             on_turn_end=self._note_hook, context=self.context
         )
@@ -404,6 +514,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         """切换到选中的会话：历史、存档、落盘目录三者一起换。"""
         from ..memory.restore import restore as restore_session
 
+        # ch12：离开旧会话（同步方法里异步触发）
+        if self.hooks is not None:
+            old_id = self.session_id or ""
+            asyncio.create_task(
+                self._fire_hook(HookEvent.SESSION_END, {"session_id": old_id})
+            )
+
         report = restore_session(meta.jsonl)
         self.conv = Conversation.from_messages(
             report.messages,
@@ -416,6 +533,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self.session_id = meta.session_id
         if self.provider is not None:
             self._setup_agent()  # 重建 ContextManager，让 spill 指向新会话目录
+        if self.hooks is not None:
+            self.hooks.reset_session()
+            asyncio.create_task(
+                self._fire_hook(
+                    HookEvent.SESSION_RESUME, {"session_id": meta.session_id}
+                )
+            )
         self.query_one("#log", RichLog).write(
             render_restored(meta.session_id, len(report.messages))
         )
@@ -442,6 +566,15 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
 
         parsed = parse(text)
         if parsed is None:
+            # ch12：UserPromptSubmit——可拦截（原因回显、消息不入历史）或注入
+            res = await self._fire_hook(HookEvent.USER_PROMPT_SUBMIT, {"prompt": text})
+            if res is not None and res.block_reason:
+                self.query_one("#log", RichLog).write(
+                    render_notice(f"提交被 Hook 拦截：{res.block_reason}")
+                )
+                return
+            if res is not None and res.injected:
+                text = "\n\n".join([*res.injected, text])
             await self.send_to_ai(text)
             return
         await self.dispatch_command(parsed)
@@ -467,6 +600,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
 
     async def send_to_ai(self, text: str) -> None:
         """把一条用户消息送进对话循环（非命令路径的唯一入口）。"""
+        # ch13：后台任务完成通知随下一轮带进主对话
+        if self._pending_notices:
+            text = "\n\n".join([*self._pending_notices, text])
+            self._pending_notices = []
         self.cancel_event = asyncio.Event()  # 每次提交重置取消信号
         log = self.query_one("#log", RichLog)
         log.write(user_block(text))
@@ -481,6 +618,13 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
     async def start_new_session(self) -> str | None:
         """`/clear`：新建会话目录与存档，重建 Agent 让落盘指向新目录。"""
         from ..memory import session as session_mod
+
+        # ch12：关闭旧会话 → 重置 only_once → 新会话开始
+        await self._fire_hook(
+            HookEvent.SESSION_END, {"session_id": self.session_id or ""}
+        )
+        if self.hooks is not None:
+            self.hooks.reset_session()
 
         # F14：清空对话顺带清掉已激活的 Skill（SOP 不再钉入）
         if self.skill_manager is not None:
@@ -500,6 +644,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         )
         if self.provider is not None:
             self._setup_agent()  # 重建 ContextManager，spill 指向新会话目录
+        await self._fire_hook(
+            HookEvent.SESSION_START,
+            {"session_id": sid, "cwd": os.getcwd()},
+        )
         return sid
 
     def handle_tab(self) -> None:
@@ -635,12 +783,24 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             await self._await_restore_compress()  # 压缩也在写 jsonl，先等它
             if self.agent is not None:
                 await self.agent.drain_note_tasks()
+            # ch12：会话结束（进程关闭前）
+            await self._fire_hook(
+                HookEvent.SESSION_END, {"session_id": self.session_id or ""}
+            )
+            if self.hooks is not None:
+                await self.hooks.drain()
             if self.writer is not None:
                 self.writer.close()
             self.exit()
 
     def on_option_list_option_selected(self, event) -> None:
-        """三个 OptionList 共用一个事件：按 id 分派。"""
+        """三个 OptionList 共用同一个事件：按 id 分流。
+
+        注意：Textual 8 会沿 MRO 逐个调用同名处理器，SelectMixin 的同名方法
+        也会被调用一次。所以这里**只**处理 resume / command 两种列表，
+        其余（provider_list）直接返回，交给 SelectMixin 自己处理——不能再
+        调 `super()`，否则 provider 选择会被执行两次。
+        """
         oid = getattr(event.option_list, "id", None)
         if oid == "resume_list":
             self._select_session(event.option_index)
@@ -648,8 +808,6 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         if oid == "command_list":
             self._select_command(event.option_index)
             return
-        # 否则是 provider 选择（沿用 SelectMixin 的行为）
-        super().on_option_list_option_selected(event)
 
 
 def _home_memory_dir() -> Path:
@@ -679,4 +837,13 @@ def _last_assistant(conv: Conversation) -> str:
     for m in reversed(conv.messages()):
         if m.role == "assistant" and m.content:
             return m.content
+    return ""
+
+
+def _preview_args(input: dict) -> str:
+    """工具入参的一句预览（审批弹窗用）。"""
+    for key in ("path", "command", "pattern", "prompt"):
+        if key in input:
+            s = str(input[key])
+            return s if len(s) <= 40 else s[:40] + "…"
     return ""

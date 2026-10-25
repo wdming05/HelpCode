@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from . import prompt
 from .context import CompressInfo, ContextManager
 from .conversation import Conversation
+from .hook.events import HookEvent
 from .llm import (
     ContextLengthExceeded,
     Provider,
@@ -84,6 +85,11 @@ class Agent:
         system_extra: tuple[str, str] = ("", ""),
         on_turn_end=None,
         skills=None,
+        hooks=None,
+        system_prompt: str | None = None,
+        max_turns: int | None = None,
+        auto_approve_ask: bool = False,
+        approval_handler=None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -97,9 +103,23 @@ class Agent:
         # Skill 管理器（鸭子类型）：提供 render_available()/render_active()/
         # allowed_tools() 三个方法。测试不传即空行为，agent 不 import skill。
         self._skills = skills
+        # ch12：Hook 引擎（鸭子类型，提供 async dispatch(event, payload)）。
+        # 测试不传即空行为；agent 不 import hook 的引擎，只 import 事件枚举。
+        self._hooks = hooks
+        # ch13：子 Agent 可完全覆盖系统提示、限制轮数、自动放行 Ask、外接审批回调
+        self._system_prompt = system_prompt
+        self._max_turns = max_turns
+        self._auto_approve_ask = auto_approve_ask
+        self._approval_handler = approval_handler
         self._on_turn_end = on_turn_end
         self._note_tasks: set[asyncio.Task] = set()
         self._turn_count = 0
+
+    async def _dispatch(self, event: HookEvent, payload: dict):
+        """触发 Hook；没装配引擎时返回 None。"""
+        if self._hooks is None:
+            return None
+        return await self._hooks.dispatch(event, payload)
 
     async def run(
         self,
@@ -120,18 +140,23 @@ class Agent:
             available_skills = self._skills.render_available()
         else:
             active_skills = available_skills = ""
-        sys = prompt.build_system_prompt(
-            self._system_extra[0],
-            self._system_extra[1],
-            active_skills,
-            available_skills,
-        )
+        # ch13：子 Agent 用角色正文完全替代主 Agent 系统提示
+        if self._system_prompt is not None:
+            sys = self._system_prompt
+        else:
+            sys = prompt.build_system_prompt(
+                self._system_extra[0],
+                self._system_extra[1],
+                active_skills,
+                available_skills,
+            )
         env_text = env.render()
 
         # ch11：白名单收窄——有 Skill 激活时只露出白名单并集（恒含 load_skill）。
         allowed = self._skills.allowed_tools() if self._skills is not None else None
 
-        for iteration in range(1, self.MAX_ITERATIONS + 1):
+        max_turns = self._max_turns or self.MAX_ITERATIONS
+        for iteration in range(1, max_turns + 1):
             # 终止优先级：取消最高（协作式，每轮开头检查）
             if cancel_event.is_set():
                 yield AgentEvent(notice="已取消")
@@ -160,14 +185,23 @@ class Agent:
             tool_names = [t["name"] for t in (tools or [])]
 
             # ch08：每个请求前估算一次；需要压缩则先发 start 事件（用户立刻有反馈）
-            if self.context.should_compress(conv):
+            # ch12：同步压缩前后触发 PreCompact / PostCompact
+            will_compress = self.context.should_compress(conv)
+            if will_compress:
+                before_tokens = self.context.estimate(conv)
+                await self._dispatch(
+                    HookEvent.PRE_COMPACT, {"tokens_before": before_tokens}
+                )
                 yield AgentEvent(
-                    compress=CompressInfo(
-                        phase="start", tokens_before=self.context.estimate(conv)
-                    )
+                    compress=CompressInfo(phase="start", tokens_before=before_tokens)
                 )
 
             report = await self.context.before_request(conv, cancel_event, tool_names)
+            if will_compress or report.info is not None:
+                await self._dispatch(
+                    HookEvent.POST_COMPACT,
+                    {"tokens_after": self.context.estimate(conv)},
+                )
             if report.cancelled:
                 yield AgentEvent(notice="已取消")
                 yield AgentEvent(done=True)
@@ -177,6 +211,21 @@ class Agent:
             if report.info is not None:
                 yield AgentEvent(compress=report.info)
 
+            # ch12：每轮请求前触发 PreUserMessage；prompt 动作注入进本轮提醒
+            round_reminder = reminder
+            if self._hooks is not None:
+                last_user = next(
+                    (m.content for m in reversed(conv.messages()) if m.role == "user"),
+                    "",
+                )
+                injected = await self._dispatch(
+                    HookEvent.PRE_USER_MESSAGE, {"prompt": last_user}
+                )
+                if injected is not None and injected.injected:
+                    round_reminder = (
+                        reminder + "\n" + "\n".join(injected.injected)
+                    ).strip()
+
             # 流式收集：双路（实时 yield + 累积完整文本）
             # 撞墙（PTL）则紧急压缩后在同一迭代重试一次，不消耗额外迭代预算
             out: dict = {}
@@ -185,7 +234,7 @@ class Agent:
                 out = {}
                 hit_wall = False
                 async for ev in self._stream_once(
-                    conv, sys, env_text, tools, reminder, out
+                    conv, sys, env_text, tools, round_reminder, out
                 ):
                     if ev.err is None:
                         yield ev
@@ -203,6 +252,9 @@ class Agent:
                     emergency_retried = True
                     hit_wall = True
                     before = self.context.estimate(conv)
+                    await self._dispatch(
+                        HookEvent.PRE_COMPACT, {"tokens_before": before}
+                    )
                     yield AgentEvent(
                         compress=CompressInfo(phase="start", tokens_before=before)
                     )
@@ -211,6 +263,9 @@ class Agent:
                         conv, emergency=True, tool_names=tool_names
                     )
                     after = rep.tokens_after or self.context.estimate(conv)
+                    await self._dispatch(
+                        HookEvent.POST_COMPACT, {"tokens_after": after}
+                    )
                     yield AgentEvent(
                         compress=CompressInfo(
                             phase="done",
@@ -238,6 +293,8 @@ class Agent:
             if not tool_calls or text:
                 conv.add_assistant(text)
                 self._maybe_start_note_task(conv)
+                # ch12：自然停止触发 Stop（done 之前；取消/出错路径不走这里）
+                await self._dispatch(HookEvent.STOP, {"messages": len(conv.messages())})
                 if usage is not None:
                     yield AgentEvent(token_usage=usage)
                 yield AgentEvent(done=True)
@@ -268,6 +325,17 @@ class Agent:
             for call in tool_calls:
                 yield AgentEvent(tool_start=call)
             for call, result in zip(tool_calls, results):
+                # ch12：单条结果拿到后、emit tool_end 之前触发 PostToolUse
+                # （权限 Deny / 未知工具 / 被 Hook 拦的也算，is_error 为真）
+                await self._dispatch(
+                    HookEvent.POST_TOOL_USE,
+                    {
+                        "tool": call.name,
+                        "input": call.input or {},
+                        "is_error": bool(result.is_error or not result.ok),
+                        "result": result.content[:500],
+                    },
+                )
                 yield AgentEvent(tool_end=result, tool_call=call)
                 conv.add_tool_result(call.id, result)
 
@@ -275,6 +343,36 @@ class Agent:
         yield AgentEvent(notice="已达到最大迭代次数")
         self._ensure_assistant_tail(conv, "已达到最大迭代次数")
         yield AgentEvent(done=True)
+
+    async def run_to_completion(
+        self,
+        conv: Conversation,
+        task: str,
+        mode: Mode = Mode.DEFAULT,
+        cancel_event: asyncio.Event | None = None,
+    ) -> str:
+        """跑到底：把任务当 user 消息追加，直到模型不再调工具，返回最后文本。"""
+        event = cancel_event if cancel_event is not None else asyncio.Event()
+        text = ""
+        notice = ""
+        async for ev in self.run(task, conv, event, mode):
+            if ev.err is not None:
+                return f"（执行出错：{ev.err.__class__.__name__}: {ev.err}）"
+            if ev.text:
+                text += ev.text
+            if ev.notice:
+                notice = ev.notice
+            if ev.done:
+                break
+        last = ""
+        for m in reversed(conv.messages()):
+            if m.role == "assistant" and m.content:
+                last = m.content
+                break
+        result = last or text
+        if notice:
+            result = f"{result}\n\n（{notice}）" if result else notice
+        return result
 
     async def _stream_once(
         self,
@@ -323,6 +421,19 @@ class Agent:
             conv, emergency=emergency, tool_names=self.registry.names()
         )
 
+    async def _pre_tool_block(self, call: ToolCall) -> ToolResult | None:
+        """ch12：PreToolUse 拦截。返回失败结果表示拦截，None 表示放行。"""
+        if self._hooks is None:
+            return None
+        res = await self._hooks.dispatch(
+            HookEvent.PRE_TOOL_USE, {"tool": call.name, "input": call.input or {}}
+        )
+        if res is not None and res.block_reason:
+            return ToolResult(
+                ok=False, content=f"Hook 拦截：{res.block_reason}", is_error=True
+            )
+        return None
+
     async def _execute_calls(
         self,
         calls: list[ToolCall],
@@ -351,6 +462,10 @@ class Agent:
                     j += 1
                 to_run: list[int] = []
                 for k in batch:
+                    blocked = await self._pre_tool_block(calls[k])
+                    if blocked is not None:
+                        results[k] = blocked
+                        continue
                     decision, reason = check(self.engine, mode, calls[k], True)
                     if decision is Decision.DENY:
                         results[k] = ToolResult(ok=False, content=reason, is_error=True)
@@ -375,23 +490,36 @@ class Agent:
                 i = j
             else:
                 # 副作用串行：check → ALLOW 执行 / DENY 预置 / ASK 人在回路
+                blocked = await self._pre_tool_block(calls[i])
+                if blocked is not None:
+                    results[i] = blocked
+                    i += 1
+                    continue
                 decision, reason = check(self.engine, mode, calls[i], False)
                 if decision is Decision.DENY:
                     results[i] = ToolResult(ok=False, content=reason, is_error=True)
                 elif decision is Decision.ALLOW:
                     results[i] = await self._execute_one(calls[i])
                 else:  # ASK
-                    out: dict = {}
-                    async for ev in self._request_approval(
-                        calls[i], reason, cancel_event, out
-                    ):
-                        yield ev
-                    if out.get("cancelled"):
-                        results[i] = ToolResult(
-                            ok=False, content="已取消", is_error=True
-                        )
-                        return  # 取消：停止后续执行，交上层收尾
-                    outcome = out.get("outcome")
+                    outcome = None
+                    if self._auto_approve_ask:
+                        # 子 Agent 的 dontAsk：规则/模式都没命中时自动放行
+                        outcome = Outcome.ALLOW_ONCE
+                    elif self._approval_handler is not None:
+                        # 子 Agent：升级到主 TUI 审批
+                        outcome = await self._approval_handler(calls[i], reason)
+                    else:
+                        out: dict = {}
+                        async for ev in self._request_approval(
+                            calls[i], reason, cancel_event, out
+                        ):
+                            yield ev
+                        if out.get("cancelled"):
+                            results[i] = ToolResult(
+                                ok=False, content="已取消", is_error=True
+                            )
+                            return  # 取消：停止后续执行，交上层收尾
+                        outcome = out.get("outcome")
                     if outcome is Outcome.ALLOW_FOREVER:
                         try:
                             persist_local_allow(self.engine, calls[i])

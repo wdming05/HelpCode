@@ -26,7 +26,16 @@ class SelectMixin:
         self.query_one("#input").focus()
 
     def on_option_list_option_selected(self, event) -> None:
-        """用户选定一个 provider 后进入对话。"""
+        """用户选定一个 provider 后进入对话。
+
+        必须按 id 严格分流：Textual 8 会沿 MRO 逐个调用同名处理器，
+        本方法会与 HelpCodeApp 的同名方法**先后都被调用**。若不判断 id，
+        选中 `#command_list` / `#resume_list` 时也会走到这里，把命令项
+        当成 provider，进而操作单 provider 模式下不存在的 `#provider_list`
+        而崩溃。
+        """
+        if getattr(event.option_list, "id", None) != "provider_list":
+            return
         cfg = self.providers[event.option_index]
         self.provider_cfg = cfg
         self.provider = new_provider(cfg)

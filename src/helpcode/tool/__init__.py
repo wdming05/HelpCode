@@ -85,6 +85,15 @@ class Registry:
         tool = self._tools.get(name)
         return tool.read_only if tool is not None else False
 
+    def subset(self, names) -> "Registry":
+        """返回只含指定工具的新注册中心（子 Agent 过滤用，不改本表）。"""
+        allowed = set(names)
+        out = Registry()
+        for name, tool in self._tools.items():
+            if name in allowed:
+                out.register(tool)
+        return out
+
 
 def new_default_registry() -> Registry:
     """注册全部 6 个工具，返回注册中心。"""

@@ -5,6 +5,7 @@ import time
 
 from textual.widgets import RichLog, Static
 
+from ..hook.events import HookEvent
 from . import SessionState
 from .view import (
     error_block,
@@ -30,6 +31,11 @@ class StreamMixin:
                 text, self.conv, self.cancel_event, self.mode
             ):
                 if ev.err is not None:
+                    # ch12：流式报错 → Notification
+                    await self._fire_hook(
+                        HookEvent.NOTIFICATION,
+                        {"kind": "error", "message": str(ev.err)},
+                    )
                     self._finish_with_error(ev.err)
                     return
                 if ev.iteration is not None:
@@ -47,6 +53,14 @@ class StreamMixin:
                     usage = ev.token_usage
                     self.last_usage = ev.token_usage  # 供 /status 读取
                 if ev.permission_request is not None:
+                    # ch12：弹出审批 → Notification
+                    await self._fire_hook(
+                        HookEvent.NOTIFICATION,
+                        {
+                            "kind": "approval",
+                            "message": ev.permission_request.reason,
+                        },
+                    )
                     self._pending_request = ev.permission_request
                     self._approve_cursor = 0
                     self.state = SessionState.APPROVING

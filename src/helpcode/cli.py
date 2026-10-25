@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .command import DuplicateCommandError, build_default_registry
 from .config import Config, ConfigError, load
+from .hook import HookEngine, load_hooks
 from .mcp import McpManager, load_mcp_config
 from .memory import cleanup as cleanup_mod
 from .memory import index as index_mod
@@ -20,6 +21,7 @@ from .skill import (
     register_skill_commands,
     validate_whitelists,
 )
+from .subagent import load_catalog
 from .tool import new_default_registry
 from .tui.app import HelpCodeApp
 
@@ -105,6 +107,17 @@ async def _run(cfg: Config) -> None:
         commands = build_default_registry()
         register_skill_commands(commands, skill_manager)
 
+        # 6) ch12：加载 Hook（两层叠加），配置错误只告警不阻断
+        hook_list, hook_warnings = load_hooks(root, home)
+        for warning in hook_warnings:
+            print(f"（Hook 提示）{warning}", file=sys.stderr)
+        hook_engine = HookEngine(hook_list)
+
+        # 7) ch13：加载角色目录（项目 > 用户 > 内置）
+        catalog, catalog_warnings = load_catalog(root, home)
+        for warning in catalog_warnings:
+            print(f"（Agent 提示）{warning}", file=sys.stderr)
+
         app = HelpCodeApp(
             cfg.providers,
             mcp_tools,
@@ -120,6 +133,8 @@ async def _run(cfg: Config) -> None:
             instruction_set=instruction_set,
             index_bundle=bundle,
             skill_manager=skill_manager,
+            hooks=hook_engine,
+            catalog=catalog,
         )
         await app.run_async()
     finally:
