@@ -24,6 +24,7 @@ from .skill import (
 from .subagent import load_catalog
 from .tool import new_default_registry
 from .tui.app import HelpCodeApp
+from .worktree import Manager, NotARepoError
 
 CONFIG_PATH = ".helpcode/config.yaml"
 
@@ -118,6 +119,9 @@ async def _run(cfg: Config) -> None:
         for warning in catalog_warnings:
             print(f"（Agent 提示）{warning}", file=sys.stderr)
 
+        # 8) ch14：Worktree 管理器。非 git 仓库只降级，不阻断启动
+        worktrees = _build_worktrees(root)
+
         app = HelpCodeApp(
             cfg.providers,
             mcp_tools,
@@ -135,12 +139,37 @@ async def _run(cfg: Config) -> None:
             skill_manager=skill_manager,
             hooks=hook_engine,
             catalog=catalog,
+            worktrees=worktrees,
         )
         await app.run_async()
     finally:
         if writer is not None:
             writer.close()
         await manager.aclose()
+
+
+def _build_worktrees(root: Path):
+    """构造 Worktree 管理器，顺手清理过期临时目录。
+
+    非 git 仓库直接降级为 None：Worktree 只是并行隔离的增强项，
+    没有它程序照常工作（ch14 N1）。
+    """
+    try:
+        wt_manager = Manager(root)
+    except NotARepoError as e:
+        print(f"（Worktree 未启用）{e}", file=sys.stderr)
+        return None
+    try:
+        report = wt_manager.cleanup_stale()
+        if report:
+            print(
+                f"（Worktree 清理）删除 {len(report.removed)} 个"
+                f"、保留 {len(report.kept)} 个（有改动）",
+                file=sys.stderr,
+            )
+    except Exception as e:  # 清理失败不该阻断启动
+        print(f"（Worktree 清理跳过）{e.__class__.__name__}: {e}", file=sys.stderr)
+    return wt_manager
 
 
 def _build_conversation(root: Path, latest):

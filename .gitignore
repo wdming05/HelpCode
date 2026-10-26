@@ -28,3 +28,6 @@ ch05-*.md
 
 # 会话存档（本地数据，不入库）
 .helpcode/sessions/
+
+# ch14：Worktree 隔离目录（本地生成，不入库）
+.helpcode/worktrees/

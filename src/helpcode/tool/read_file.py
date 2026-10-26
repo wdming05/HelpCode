@@ -1,8 +1,7 @@
 """读文件工具。"""
 
-from pathlib import Path
-
 from . import ToolResult
+from .paths import resolve_path
 
 
 class ReadFileTool:
@@ -10,6 +9,8 @@ class ReadFileTool:
 
     name = "read_file"
     read_only = True
+    # ch14：支持显式工作目录（cwd 不是模型可见参数，由 Agent 注入）
+    cwd_aware = True
     description = (
         "读取指定文件的内容，返回带行号的文本，便于引用。"
         "可指定起始行 offset 与读取行数 limit；文件过长时会截断并提示。"
@@ -27,8 +28,14 @@ class ReadFileTool:
         "required": ["path"],
     }
 
-    def run(self, path: str, offset: int = 1, limit: int = 200) -> ToolResult:
-        p = Path(path)
+    def run(
+        self,
+        path: str,
+        offset: int = 1,
+        limit: int = 200,
+        cwd: str | None = None,
+    ) -> ToolResult:
+        p = resolve_path(path, cwd)
         if not p.exists():
             return ToolResult(ok=False, content=f"错误：文件不存在 {path}")
         if p.is_dir():

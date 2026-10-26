@@ -1,6 +1,7 @@
 """按模式找文件工具。"""
 
 import glob as _glob
+import os
 
 from . import ToolResult
 
@@ -13,6 +14,7 @@ class GlobTool:
 
     name = "glob"
     read_only = True
+    cwd_aware = True  # ch14：支持显式工作目录
     description = "按 glob 模式查找文件，返回匹配的文件路径列表。支持 ** 递归匹配。"
     parameters = {
         "type": "object",
@@ -22,9 +24,14 @@ class GlobTool:
         "required": ["pattern"],
     }
 
-    def run(self, pattern: str) -> ToolResult:
+    def run(self, pattern: str, cwd: str | None = None) -> ToolResult:
+        # 模式本身没有 Path 语义（含 * ?），不能过 resolve_path：
+        # 绝对模式原样用，相对模式拼到 cwd 上
+        target = (
+            pattern if os.path.isabs(pattern) or not cwd else os.path.join(cwd, pattern)
+        )
         try:
-            matches = _glob.glob(pattern, recursive=True)
+            matches = _glob.glob(target, recursive=True)
         except Exception as e:
             return ToolResult(ok=False, content=f"错误：glob 模式无效 {e}")
         if not matches:

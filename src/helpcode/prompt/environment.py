@@ -31,10 +31,17 @@ class Environment:
         return "\n".join(f"{key}: {value}" for key, value in items if value)
 
 
-async def gather_environment(version: str, model: str) -> Environment:
-    """采集一次会话的环境信息。不读取任何环境变量。"""
+async def gather_environment(
+    version: str, model: str, cwd: str | None = None
+) -> Environment:
+    """采集一次会话的环境信息。不读取任何环境变量。
+
+    ch14：``cwd`` 由调用方显式给（Agent 的当前工作目录）。主 Agent 进了
+    Worktree 之后，环境段里的「工作目录」必须是 Worktree——否则模型会照着
+    主仓库路径汇报位置，和实际落盘位置对不上。
+    """
     try:
-        working_dir = os.getcwd()
+        working_dir = cwd or os.getcwd()
     except OSError:
         working_dir = ""
     env = Environment(
@@ -44,17 +51,18 @@ async def gather_environment(version: str, model: str) -> Environment:
         version=version,
         model=model,
     )
-    env.git_status = await _git_status()
+    env.git_status = await _git_status(working_dir or None)
     return env
 
 
-async def _git_status() -> str:
+async def _git_status(cwd: str | None = None) -> str:
     """采集 git 状态摘要；失败/非 git 目录/超时降级为空串。"""
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
             "status",
             "--porcelain",
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )

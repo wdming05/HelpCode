@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -90,6 +91,7 @@ class Agent:
         max_turns: int | None = None,
         auto_approve_ask: bool = False,
         approval_handler=None,
+        cwd: str | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -111,6 +113,10 @@ class Agent:
         self._max_turns = max_turns
         self._auto_approve_ask = auto_approve_ask
         self._approval_handler = approval_handler
+        # ch14：本次 Agent 的工作目录。每个工具调用把它显式传给工具，
+        # 而不是靠进程 cwd——主 Agent 与后台子 Agent 在同一进程里，
+        # 谁都不该去 chdir 影响别人。
+        self.cwd = str(cwd) if cwd else os.getcwd()
         self._on_turn_end = on_turn_end
         self._note_tasks: set[asyncio.Task] = set()
         self._turn_count = 0
@@ -132,7 +138,11 @@ class Agent:
         unknown_run = 0
 
         # ch05：采集环境 + 装配稳定 system（一次，循环外）
-        env = await prompt.gather_environment(self._version, self.provider.model)
+        # ch14：工作目录取自 self.cwd——进 Worktree 后环境段必须跟着变，
+        # 否则模型会按主仓库路径汇报文件位置
+        env = await prompt.gather_environment(
+            self._version, self.provider.model, self.cwd
+        )
         # ch11：已激活 Skill 每轮从管理器现读——激活状态会随 load_skill 变化，
         # 不能像指令/记忆那样在构造时快照。
         if self._skills is not None:
@@ -570,12 +580,17 @@ class Agent:
                 ok=False, content=f"错误：未知工具 {call.name}", is_error=True
             )
         try:
+            # ch14：支持显式工作目录的工具，把本次调用的 cwd 注进去。
+            # 模型看不到这个参数（schema 不变），所以不存在「用户传错 cwd」。
+            kwargs = dict(call.input)
+            if getattr(tool, "cwd_aware", False):
+                kwargs["cwd"] = self.cwd
             # 异步工具（MCP 等）直接在事件循环里跑：它们的会话绑定 loop，
             # 丢进线程池调用必然失败。
             if isinstance(tool, AsyncTool):
-                return await tool.arun(**call.input)
+                return await tool.arun(**kwargs)
             # 同步工具函数放到线程执行，避免阻塞事件循环
-            return await asyncio.to_thread(tool.run, **call.input)
+            return await asyncio.to_thread(tool.run, **kwargs)
         except Exception as e:
             return ToolResult(
                 ok=False, content=f"错误：工具执行失败 {e}", is_error=True

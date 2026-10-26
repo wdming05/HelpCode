@@ -1,8 +1,7 @@
 """改文件工具。"""
 
-from pathlib import Path
-
 from . import ToolResult
+from .paths import resolve_path
 
 
 class EditFileTool:
@@ -10,6 +9,7 @@ class EditFileTool:
 
     name = "edit_file"
     read_only = False
+    cwd_aware = True  # ch14：支持显式工作目录
     description = (
         "把文件中「old_string」这段原文替换成「new_string」。"
         "要求 old_string 在文件中恰好出现一次；出现 0 次或多次会报错。"
@@ -25,8 +25,14 @@ class EditFileTool:
         "required": ["path", "old_string", "new_string"],
     }
 
-    def run(self, path: str, old_string: str, new_string: str) -> ToolResult:
-        p = Path(path)
+    def run(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        cwd: str | None = None,
+    ) -> ToolResult:
+        p = resolve_path(path, cwd)
         if not p.exists():
             return ToolResult(ok=False, content=f"错误：文件不存在 {path}")
         try:

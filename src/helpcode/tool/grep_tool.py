@@ -1,8 +1,7 @@
 """搜代码内容工具。"""
 
-from pathlib import Path
-
 from . import ToolResult
+from .paths import resolve_path
 
 # 命中条数上限
 _RESULT_LIMIT = 200
@@ -13,6 +12,7 @@ class GrepTool:
 
     name = "grep"
     read_only = True
+    cwd_aware = True  # ch14：支持显式工作目录
     description = (
         "在文件内容中搜索指定文本，返回命中位置（文件路径、行号、该行内容）。"
         "path 可指定单个文件或目录（默认当前目录，递归搜索）。"
@@ -26,8 +26,8 @@ class GrepTool:
         "required": ["pattern"],
     }
 
-    def run(self, pattern: str, path: str = ".") -> ToolResult:
-        p = Path(path)
+    def run(self, pattern: str, path: str = ".", cwd: str | None = None) -> ToolResult:
+        p = resolve_path(path, cwd)
         if not p.exists():
             return ToolResult(ok=False, content=f"错误：路径不存在 {path}")
 

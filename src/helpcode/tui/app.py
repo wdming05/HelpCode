@@ -39,6 +39,7 @@ from ..subagent import (
     TaskStopTool,
 )
 from ..tool import new_default_registry
+from ..worktree import ExitAction, WorktreeHasChangesError
 from . import SessionState
 from .host import TextualHost
 from .resume import ResumeMixin
@@ -143,6 +144,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         skill_manager=None,
         hooks=None,
         catalog=None,
+        worktrees=None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -177,6 +179,9 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self.subagent_runner: SubAgentRunner | None = None
         # 后台任务完成通知，下一次发送前拼进用户消息
         self._pending_notices: list[str] = []
+        # ch14：Worktree 管理器（非 git 仓库时为 None）+ 当前主 Agent 的工作目录
+        self.worktrees = worktrees
+        self.worktree_cwd: str | None = None
         self.last_usage = None  # 最近一次请求的 token 用量（/status 用）
         self.cancel_event = asyncio.Event()
         self.mode = Mode.DEFAULT
@@ -307,6 +312,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             on_turn_end=on_turn_end,
             skills=self.skill_manager,
             hooks=self.hooks,
+            # ch14：主 Agent 的工作目录可能是某个 Worktree（/worktree create 之后）
+            cwd=self.worktree_cwd or os.getcwd(),
         )
 
     async def _fire_hook(self, event: HookEvent, payload: dict):
@@ -314,6 +321,142 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         if self.hooks is None:
             return None
         return await self.hooks.dispatch(event, payload)
+
+    # ------------------------------------------------------------ Worktree（ch14）
+
+    async def run_worktree(self, sub: str, args: str) -> str:
+        """`/worktree` 的实现：只返回文本，渲染交给命令层。"""
+        if self.worktrees is None:
+            return "Worktree 未启用（当前目录不是 git 仓库根目录）"
+        if sub == "create":
+            return await self._worktree_create(args)
+        if sub == "enter":
+            return await self._worktree_enter(args)
+        if sub == "list":
+            return self._worktree_list()
+        if sub == "exit":
+            return await self._worktree_exit(remove="--remove" in args.split())
+        if sub == "remove":
+            return await self._worktree_remove(args)
+        return f"未知子命令：{sub}（可用：create / enter / list / exit / remove）"
+
+    async def _worktree_create(self, slug: str) -> str:
+        name = slug.strip()
+        if not name:
+            return "用法：/worktree create <名字>"
+        # 已存在时不要只丢一句「创建失败」——用户真正想做的是「进去」
+        if self.worktrees.get(name) is not None:
+            return (
+                f"Worktree 已存在：{name}\n"
+                f"· 进入它：/worktree enter {name}\n"
+                f"· 删掉重建：/worktree remove {name} --discard"
+            )
+        try:
+            # git 子进程是阻塞的：丢线程，别让界面卡住
+            wt = await asyncio.to_thread(self.worktrees.create, name, manual=True)
+            session = await asyncio.to_thread(self.worktrees.enter, wt.name)
+        except Exception as e:
+            return f"创建失败：{e}"
+        self._enter_worktree(str(wt.path))
+        return (
+            f"已创建并进入 Worktree：{wt.path}\n"
+            f"分支：{wt.branch}\n"
+            f"会话：{session.session_id[:8]}（之后的文件操作都在这个目录里）"
+        )
+
+    async def _worktree_enter(self, slug: str) -> str:
+        """进入一个**已存在**的 Worktree（不创建）。"""
+        name = slug.strip()
+        if not name:
+            return "用法：/worktree enter <名字>"
+        wt = self.worktrees.get(name)
+        if wt is None:
+            return f"没有这个 Worktree：{name}（用 /worktree list 看已有哪些）"
+        try:
+            session = await asyncio.to_thread(self.worktrees.enter, name)
+        except Exception as e:
+            return f"进入失败：{e}"
+        self._enter_worktree(str(wt.path))
+        return (
+            f"已进入 Worktree：{wt.path}\n"
+            f"分支：{wt.branch}\n"
+            f"会话：{session.session_id[:8]}（之后的文件操作都在这个目录里）"
+        )
+
+    def _worktree_list(self) -> str:
+        items = self.worktrees.list()
+        if not items:
+            return "（无 Worktree）"
+        current = self.worktrees.current_session
+        lines: list[str] = []
+        for wt in items:
+            mark = " *当前" if current and current.worktree_name == wt.name else ""
+            kind = "手动" if wt.manual else "临时"
+            lines.append(f"- {wt.name}  [{kind}]{mark}\n  {wt.branch}\n  {wt.path}")
+        if current is None:
+            lines.append("（当前不在任何 Worktree；用 /worktree enter <名字> 进入）")
+        return "\n".join(lines)
+
+    async def _worktree_exit(self, *, remove: bool) -> str:
+        session = self.worktrees.current_session
+        if session is None:
+            return "当前不在任何 Worktree 会话中"
+        action = ExitAction.REMOVE if remove else ExitAction.KEEP
+        try:
+            report = await asyncio.to_thread(
+                self.worktrees.exit, session.worktree_name, action
+            )
+        except WorktreeHasChangesError:
+            return (
+                "退出失败：Worktree 有未提交修改或新增 commit。\n"
+                f"确认丢弃请用 /worktree remove {session.worktree_name} --discard"
+            )
+        except Exception as e:
+            return f"退出失败：{e}"
+        self._leave_worktree()
+        if report.removed:
+            return f"已退出并删除 Worktree：{report.path}"
+        return f"已退出 Worktree：{report.path}（目录保留）"
+
+    async def _worktree_remove(self, args: str) -> str:
+        parts = args.split()
+        name = next((p for p in parts if not p.startswith("--")), "")
+        if not name:
+            return "用法：/worktree remove <名字> [--discard]"
+        discard = "--discard" in parts
+        try:
+            report = await asyncio.to_thread(
+                self.worktrees.remove, name, discard_changes=discard
+            )
+        except WorktreeHasChangesError:
+            return "删除失败：有未提交修改或新增 commit。确认丢弃请加 --discard"
+        except Exception as e:
+            return f"删除失败：{e}"
+        if self.worktree_cwd == report.path:
+            self._leave_worktree()
+        return f"已删除 Worktree：{report.path}（分支 {report.branch}）"
+
+    def _enter_worktree(self, path: str) -> None:
+        """把主 Agent 的工作目录切到 Worktree（不 chdir）。"""
+        self.worktree_cwd = path
+        if self.agent is not None:
+            self.agent.cwd = path
+        # 模型自己的系统提示是会话开始时定的，不会因为 cwd 变了就重算；
+        # 不主动说一声，它会照着主仓库路径汇报文件位置（实际落在 Worktree 里）
+        self._announce(
+            f"[Worktree] 你的文件操作现在落在独立工作目录：{path}"
+            "（相对路径都相对它；报告文件位置时请用这个目录下的路径）"
+        )
+
+    def _leave_worktree(self) -> None:
+        self.worktree_cwd = None
+        if self.agent is not None:
+            self.agent.cwd = os.getcwd()
+        self._announce(f"[Worktree] 已退出，文件操作回到主工作目录：{os.getcwd()}")
+
+    def _announce(self, text: str) -> None:
+        """把一条说明挂到下一轮用户消息前（复用后台任务通知的通道）。"""
+        self._pending_notices.append(text)
 
     def _parent_context(self) -> ParentContext:
         """把父侧能力打包给子 Agent 运行器。"""
@@ -386,7 +529,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self.subagent_runner = None
         if self.catalog is not None:
             self.subagent_runner = SubAgentRunner(
-                self.catalog, self.task_manager, self._parent_context()
+                self.catalog,
+                self.task_manager,
+                self._parent_context(),
+                worktrees=self.worktrees,
             )
 
         self.agent = self._build_agent(

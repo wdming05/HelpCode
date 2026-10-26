@@ -1,8 +1,7 @@
 """写文件工具。"""
 
-from pathlib import Path
-
 from . import ToolResult
+from .paths import resolve_path
 
 
 class WriteFileTool:
@@ -10,6 +9,7 @@ class WriteFileTool:
 
     name = "write_file"
     read_only = False
+    cwd_aware = True  # ch14：支持显式工作目录
     description = "把内容写入指定文件（覆盖原有内容）；父目录不存在时会自动创建。"
     parameters = {
         "type": "object",
@@ -20,9 +20,9 @@ class WriteFileTool:
         "required": ["path", "content"],
     }
 
-    def run(self, path: str, content: str) -> ToolResult:
+    def run(self, path: str, content: str, cwd: str | None = None) -> ToolResult:
         try:
-            p = Path(path)
+            p = resolve_path(path, cwd)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
         except Exception as e:

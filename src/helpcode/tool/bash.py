@@ -15,6 +15,7 @@ class BashTool:
 
     name = "bash"
     read_only = False
+    cwd_aware = True  # ch14：支持显式工作目录
     description = (
         "执行一条 shell 命令，返回退出码、标准输出与标准错误。"
         "命令有超时限制；输出过长会被截断。"
@@ -28,7 +29,12 @@ class BashTool:
         "required": ["command"],
     }
 
-    def run(self, command: str, timeout: float | None = None) -> ToolResult:
+    def run(
+        self,
+        command: str,
+        timeout: float | None = None,
+        cwd: str | None = None,
+    ) -> ToolResult:
         # timeout 参数仅供测试注入极短超时；默认用 DEFAULT_TIMEOUT
         effective = timeout if timeout is not None else DEFAULT_TIMEOUT
         bash = self._find_bash()
@@ -47,6 +53,7 @@ class BashTool:
                 capture_output=True,
                 text=True,
                 shell=shell,
+                cwd=cwd or None,  # None = 沿用进程工作目录（与改造前一致）
             )
         except subprocess.TimeoutExpired:
             return ToolResult(
