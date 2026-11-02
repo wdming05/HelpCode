@@ -21,6 +21,7 @@ from ..llm import new_provider
 from ..memory.session import SessionWriter
 from ..permission import Mode, new_engine
 from ..tool import new_default_registry
+from ..tracing import Tracer
 from .mailbox import Mailbox, Message
 from .model import Team
 
@@ -34,6 +35,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-file", required=True, help="任务文本文件")
     parser.add_argument("--model", default="", help="模型覆盖")
     parser.add_argument("--plan-mode", action="store_true", help="以计划模式起步")
+    parser.add_argument("--trace-parent", default="", help="父 trace id（跨进程关联）")
     return parser.parse_args(argv)
 
 
@@ -95,6 +97,7 @@ async def _run(args: argparse.Namespace, prompt: str) -> int:
     registry = new_default_registry()
     # 队员与 Lead 共享同一套沙箱语义（默认关，由 /sandbox 控制）
     registry.attach_sandbox(engine.sandbox)
+    tracer = Tracer(root, session_dir.name, trace_id=args.trace_parent or None)
     agent = Agent(
         provider,
         registry,
@@ -102,6 +105,7 @@ async def _run(args: argparse.Namespace, prompt: str) -> int:
         engine,
         context,
         cwd=str(root),
+        tracer=tracer,
     )
 
     mode = Mode.PLAN if args.plan_mode else Mode.DEFAULT

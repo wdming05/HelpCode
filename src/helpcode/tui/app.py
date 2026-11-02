@@ -42,6 +42,7 @@ from ..team import COORDINATOR_TOOLS, coordinator_prompt
 from ..team.service import TeamService
 from ..team.tools import TeamCreateTool
 from ..tool import new_default_registry
+from ..tracing import Tracer
 from ..worktree import ExitAction, WorktreeHasChangesError
 from . import SessionState
 from .host import TextualHost
@@ -348,6 +349,9 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             # ch15：协调者模式——只留调度与读类工具，并追加四阶段指引
             extra["allowed_tools"] = set(COORDINATOR_TOOLS)
             extra["system_suffix"] = coordinator_prompt()
+        tracer = (
+            Tracer(Path(os.getcwd()), self.session_id) if self.session_id else None
+        )
         return Agent(
             self.provider,
             self._build_registry(),
@@ -360,6 +364,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             hooks=self.hooks,
             # ch14：主 Agent 的工作目录可能是某个 Worktree（/worktree create 之后）
             cwd=self.worktree_cwd or os.getcwd(),
+            tracer=tracer,
             **extra,
         )
 

@@ -47,6 +47,8 @@ class SpawnRequest:
     model: str = ""
     agent_type: str = ""
     plan_mode_required: bool = False
+    # 跨进程 trace 关联：lead 派生的子 trace id（传给 worker 作为其 trace_id）
+    trace_parent: str = ""
     # in-process 后端用：真正启动 Agent 的回调，返回 (agent_id, cancel)
     launcher: (
         Callable[[SpawnRequest], Awaitable[tuple[str, Callable | None]]] | None
@@ -121,6 +123,8 @@ def build_member_command(req: SpawnRequest) -> list[str]:
         cmd += ["--model", req.model]
     if req.plan_mode_required:
         cmd.append("--plan-mode")
+    if req.trace_parent:
+        cmd += ["--trace-parent", req.trace_parent]
     return cmd
 
 

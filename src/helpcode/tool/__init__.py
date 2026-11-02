@@ -15,6 +15,8 @@ class ToolResult:
     ok: bool
     content: str
     is_error: bool = False  # True=权限拒绝/结构化错误（UI 用红色拒绝样式区分）
+    error: dict | None = None  # 异常详情（type/traceback），供 tracing 采集（默认 None）
+    duration_ms: int | None = None  # 单工具执行耗时（tracing 用，None=未执行）
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -31,6 +33,7 @@ class Tool(Protocol):
     description: str
     parameters: dict
     read_only: bool  # True=只读可并发，False=有副作用串行
+    writes_file: bool = False  # True=会修改文件（edit_file/write_file），tracing 据此采集 file_edit
 
     def run(self, **kwargs: Any) -> ToolResult: ...
 

@@ -1,8 +1,11 @@
 """Agent Loop：多轮循环，自主调用工具直到满足停止条件。"""
 
 import asyncio
+import json
 import logging
 import os
+import time
+import traceback
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -28,6 +31,8 @@ from .permission import (
     persist_local_allow,
 )
 from .tool import AsyncTool, Registry, ToolResult
+from .tracing import NOOP, Tracer
+from .tracing.event import clip
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,7 @@ class Agent:
         inbox=None,
         allowed_tools: set[str] | None = None,
         system_suffix: str = "",
+        tracer: Tracer | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -131,6 +137,7 @@ class Agent:
         self._on_turn_end = on_turn_end
         self._note_tasks: set[asyncio.Task] = set()
         self._turn_count = 0
+        self.tracer = tracer or NOOP
 
     async def _dispatch(self, event: HookEvent, payload: dict):
         """触发 Hook；没装配引擎时返回 None。"""
@@ -151,6 +158,10 @@ class Agent:
     ) -> AsyncIterator[AgentEvent]:
         conv.add_user(user_input)
         unknown_run = 0
+        self.tracer.emit(
+            "session_start",
+            {"model": self.provider.model, "cwd": self.cwd},
+        )
 
         # ch05：采集环境 + 装配稳定 system（一次，循环外）
         # ch14：工作目录取自 self.cwd——进 Worktree 后环境段必须跟着变，
@@ -199,8 +210,10 @@ class Agent:
                 yield AgentEvent(notice="已取消")
                 self._finish_cancelled(conv)
                 yield AgentEvent(done=True)
+                self.tracer.emit("session_end", {})
                 return
 
+            self.tracer.emit("iteration", {"n": iteration})
             yield AgentEvent(iteration=iteration)
 
             # 按模式选工具与提醒
@@ -253,10 +266,21 @@ class Agent:
             if report.cancelled:
                 yield AgentEvent(notice="已取消")
                 yield AgentEvent(done=True)
+                self.tracer.emit("session_end", {})
                 return
             if report.notice:
                 yield AgentEvent(notice=report.notice)
             if report.info is not None:
+                info = report.info
+                self.tracer.emit(
+                    "compress",
+                    {
+                        "tokens_before": info.tokens_before,
+                        "tokens_after": info.tokens_after,
+                        "summarized": info.summarized,
+                        "spilled": info.spilled,
+                    },
+                )
                 yield AgentEvent(compress=report.info)
 
             # ch12：每轮请求前触发 PreUserMessage；prompt 动作注入进本轮提醒
@@ -295,6 +319,7 @@ class Agent:
                         or out.get("text")
                     ):
                         yield ev
+                        self.tracer.emit("session_end", {})
                         return
 
                     emergency_retried = True
@@ -346,6 +371,7 @@ class Agent:
                 if usage is not None:
                     yield AgentEvent(token_usage=usage)
                 yield AgentEvent(done=True)
+                self.tracer.emit("session_end", {})
                 return
 
             # 纯工具调用：记历史
@@ -360,6 +386,7 @@ class Agent:
                 yield AgentEvent(notice="连续请求未知工具，已停止")
                 self._ensure_assistant_tail(conv, "连续请求未知工具，已停止")
                 yield AgentEvent(done=True)
+                self.tracer.emit("session_end", {})
                 return
 
             # 执行（批次内权限检查 + 并发/串行），结果按原始顺序回灌
@@ -370,7 +397,15 @@ class Agent:
                 tool_calls, mode, cancel_event, results
             ):
                 yield ev
+            call_ids: dict[str, str] = {}
             for call in tool_calls:
+                call_ids[call.id] = self.tracer.emit(
+                    "tool_call",
+                    {
+                        "tool_name": call.name,
+                        "input": clip(json.dumps(call.input or {}, ensure_ascii=False)),
+                    },
+                )
                 yield AgentEvent(tool_start=call)
             for call, result in zip(tool_calls, results):
                 # ch12：单条结果拿到后、emit tool_end 之前触发 PostToolUse
@@ -384,6 +419,7 @@ class Agent:
                         "result": result.content[:500],
                     },
                 )
+                self._emit_tool_result(call, result, call_ids.get(call.id))
                 yield AgentEvent(tool_end=result, tool_call=call)
                 conv.add_tool_result(call.id, result)
 
@@ -391,6 +427,7 @@ class Agent:
         yield AgentEvent(notice="已达到最大迭代次数")
         self._ensure_assistant_tail(conv, "已达到最大迭代次数")
         yield AgentEvent(done=True)
+        self.tracer.emit("session_end", {})
 
     async def run_to_completion(
         self,
@@ -438,6 +475,15 @@ class Agent:
             system=System(stable=sys, environment=env_text),
             reminder=reminder,
         )
+        llm_start = time.perf_counter()
+        llm_event_id = self.tracer.emit(
+            "llm_request",
+            {
+                "message_count": len(conv.messages()),
+                "tool_names": [t["name"] for t in (tools or [])],
+                "model": self.provider.model,
+            },
+        )
         text = ""
         tool_calls = None
         usage = None
@@ -462,6 +508,21 @@ class Agent:
         # ch08：用服务端实测值重建锚点（含 cache_read/cache_write，见 D10）
         if usage is not None:
             self.context.after_stream(usage, len(conv.messages()))
+        self.tracer.emit(
+            "llm_response",
+            {
+                "has_tool_calls": bool(tool_calls),
+                "usage": {
+                    "input": usage.input_tokens if usage else 0,
+                    "output": usage.output_tokens if usage else 0,
+                    "cache_read": usage.cache_read if usage else 0,
+                    "cache_write": usage.cache_write if usage else 0,
+                },
+                "finish": "tool_calls" if tool_calls else "text",
+            },
+            parent_id=llm_event_id,
+            duration_ms=int((time.perf_counter() - llm_start) * 1000),
+        )
 
     async def compact_now(self, conv: Conversation, emergency: bool = False):
         """手动 / 紧急压缩（TUI 的 /compact 与撞墙重试都走这里）。"""
@@ -612,10 +673,14 @@ class Agent:
 
     async def _execute_one(self, call: ToolCall) -> ToolResult:
         """执行一个工具调用；未知工具/异常均包成 ToolResult。"""
+        start = time.perf_counter()
         tool = self.registry.get(call.name)
         if tool is None:
             return ToolResult(
-                ok=False, content=f"错误：未知工具 {call.name}", is_error=True
+                ok=False,
+                content=f"错误：未知工具 {call.name}",
+                is_error=True,
+                error={"type": "UnknownTool"},
             )
         try:
             # ch14：支持显式工作目录的工具，把本次调用的 cwd 注进去。
@@ -626,13 +691,69 @@ class Agent:
             # 异步工具（MCP 等）直接在事件循环里跑：它们的会话绑定 loop，
             # 丢进线程池调用必然失败。
             if isinstance(tool, AsyncTool):
-                return await tool.arun(**kwargs)
-            # 同步工具函数放到线程执行，避免阻塞事件循环
-            return await asyncio.to_thread(tool.run, **kwargs)
+                result = await tool.arun(**kwargs)
+            else:
+                # 同步工具函数放到线程执行，避免阻塞事件循环
+                result = await asyncio.to_thread(tool.run, **kwargs)
         except Exception as e:
-            return ToolResult(
-                ok=False, content=f"错误：工具执行失败 {e}", is_error=True
+            result = ToolResult(
+                ok=False,
+                content=f"错误：工具执行失败 {e}",
+                is_error=True,
+                error={"type": type(e).__name__, "traceback": traceback.format_exc()},
             )
+        result.duration_ms = int((time.perf_counter() - start) * 1000)
+        return result
+
+    def _emit_tool_result(
+        self, call: ToolCall, result: ToolResult, parent_id: str | None = None
+    ) -> None:
+        """把一条工具结果写入 trace：判定 status，附带异常详情与文件修改。"""
+        err = result.error or {}
+        if not result.ok or result.is_error:
+            if err.get("type") == "TimeoutError":
+                status = "timeout"
+            elif err.get("type"):
+                status = "error"
+            else:
+                status = "deny"
+        else:
+            status = "ok"
+        payload: dict = {
+            "tool_name": call.name,
+            "status": status,
+            "result_preview": clip(result.content),
+        }
+        if err.get("type"):
+            payload["error_type"] = err["type"]
+        if err.get("traceback"):
+            payload["traceback"] = clip(err["traceback"], 4000)
+        self.tracer.emit(
+            "tool_result",
+            payload,
+            parent_id=parent_id,
+            duration_ms=result.duration_ms,
+        )
+        tool = self.registry.get(call.name)
+        if result.ok and tool is not None and getattr(tool, "writes_file", False):
+            self._emit_file_edit(call, parent_id)
+
+    def _emit_file_edit(self, call: ToolCall, parent_id: str | None) -> None:
+        inp = call.input or {}
+        path = inp.get("path", "")
+        if call.name == "edit_file":
+            payload = {
+                "path": path,
+                "old": clip(inp.get("old_string", "")),
+                "new": clip(inp.get("new_string", "")),
+            }
+        else:  # write_file
+            payload = {
+                "path": path,
+                "old": None,
+                "new": clip(inp.get("content", "")),
+            }
+        self.tracer.emit("file_edit", payload, parent_id=parent_id)
 
     # ------------------------------------------------------------ 自动笔记
 

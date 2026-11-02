@@ -9,6 +9,7 @@ class EditFileTool:
 
     name = "edit_file"
     read_only = False
+    writes_file = True  # tracing：会修改文件，采集 file_edit 事件
     cwd_aware = True  # ch14：支持显式工作目录
     description = (
         "把文件中「old_string」这段原文替换成「new_string」。"

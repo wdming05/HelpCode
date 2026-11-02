@@ -22,6 +22,8 @@ from ..conversation import Conversation
 from ..memory.restore import restore as restore_session
 from ..memory.session import SessionWriter
 from ..permission import Mode
+from ..tracing import Tracer
+from ..tracing.event import new_id
 from .backend import Backend, SpawnRequest
 from .mailbox import Mailbox, Message
 from .manager import Manager
@@ -142,6 +144,7 @@ class TeamService:
             model=model,
             agent_type=role.name,
             plan_mode_required=plan_mode_required,
+            trace_parent=new_id(),
             launcher=self._launcher(team, member, runtime, prompt, plan_mode_required),
         )
         pane_id, agent_id = await backend.spawn(req)
@@ -455,6 +458,10 @@ class TeamService:
         plan_mode_required: bool,
     ):
         async def launch(_req: SpawnRequest) -> tuple[str, Callable | None]:
+            if _req.trace_parent:
+                runtime.agent.tracer = Tracer(
+                    Path(runtime.worktree), member, trace_id=_req.trace_parent
+                )
             bt = self.runner.tasks.launch(
                 runtime.agent,
                 runtime.conv,

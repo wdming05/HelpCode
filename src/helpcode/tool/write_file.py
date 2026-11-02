@@ -9,6 +9,7 @@ class WriteFileTool:
 
     name = "write_file"
     read_only = False
+    writes_file = True  # tracing：会修改文件，采集 file_edit 事件
     cwd_aware = True  # ch14：支持显式工作目录
     description = "把内容写入指定文件（覆盖原有内容）；父目录不存在时会自动创建。"
     parameters = {
