@@ -1,7 +1,7 @@
-"""五层权限判定流水线。"""
+"""六层权限判定流水线。"""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .blacklist import BLACKLIST
@@ -9,6 +9,7 @@ from .blacklist import matches as _blacklist_matches
 from .config import load_default_mode, load_rulesets
 from .decision import Decision
 from .modes import Category, Mode, fallback
+from .os_sandbox import SandboxState, create_sandbox, default_config
 from .rules import RuleSet, friendly_name
 from .sandbox import extract_target, inside
 
@@ -25,6 +26,8 @@ class Engine:
     local: RuleSet
     local_path: str
     start_mode: Mode
+    # OS 沙箱开关：与 BashTool 共享同一份可变状态，/sandbox 一次切换两边同时生效
+    sandbox: SandboxState = field(default_factory=SandboxState)
 
 
 def categorize(internal: str, read_only: bool) -> Category:
@@ -55,6 +58,7 @@ def new_engine(root: str) -> tuple[Engine, Exception | None]:
             local=RuleSet(),
             local_path=str(Path(root) / ".helpcode" / "settings.local.yaml"),
             start_mode=Mode.DEFAULT,
+            sandbox=_new_sandbox_state(root),
         )
         return eng, e
 
@@ -68,12 +72,27 @@ def new_engine(root: str) -> tuple[Engine, Exception | None]:
         local=local,
         local_path=str(Path(root_abs) / ".helpcode" / "settings.local.yaml"),
         start_mode=start_mode,
+        sandbox=_new_sandbox_state(root_abs),
     )
     return eng, None
 
 
+def _new_sandbox_state(root: str) -> SandboxState:
+    """建立沙箱状态：后端按平台挑，配置按项目根生成，默认不开。
+
+    默认关闭是有意的——沙箱会改变 bash 的可见环境（比如断网、/tmp 只读），
+    不该在用户不知情时生效。要开走 ``/sandbox``。
+    """
+    return SandboxState(
+        backend=create_sandbox(),
+        config=default_config(root),
+        enabled=False,
+        auto_allow=False,
+    )
+
+
 def check(engine: Engine, mode: Mode, call, read_only: bool) -> tuple[Decision, str]:
-    """五层判定：黑名单→沙箱→规则(local>project>user)→模式兜底。纯同步。"""
+    """六层判定：黑名单→沙箱→规则(local>project>user)→OS沙箱放行→模式兜底。纯同步。"""
     category = categorize(call.name, read_only)
     friendly = friendly_name(call.name)
 
@@ -104,7 +123,21 @@ def check(engine: Engine, mode: Mode, call, read_only: bool) -> tuple[Decision, 
                 return Decision.DENY, f"匹配 deny 规则：{friendly}({matched})"
             return Decision.ALLOW, ""
 
-    # ④ 模式兜底（只产 ALLOW/ASK）
+    # ④ OS 沙箱自动放行（仅命令类）
+    #
+    # 位置在规则引擎**之后**，不是之前：显式 deny 规则必须优先于"沙箱已开"
+    # 这种全局状态。否则用户写了 ``Bash(git *)`` 的 deny，却因为开了沙箱
+    # 被整条放过去——安全开关不该能覆盖用户明确表达的意图。
+    #
+    # 它跳过的只是 ⑤ 的模式兜底（default 模式下命令会返回 ASK）。
+    if (
+        engine.sandbox.auto_allow
+        and category is Category.EXEC
+        and engine.sandbox.active()
+    ):
+        return Decision.ALLOW, "OS 沙箱已启用，命令在隔离环境中执行"
+
+    # ⑤ 模式兜底（只产 ALLOW/ASK）
     fb = fallback(mode, category)
     if fb is Decision.ALLOW:
         return Decision.ALLOW, ""

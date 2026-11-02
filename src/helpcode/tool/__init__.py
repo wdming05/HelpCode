@@ -59,6 +59,18 @@ class Registry:
             )
         self._tools[tool.name] = tool
 
+    def attach_sandbox(self, sandbox) -> None:
+        """把权限引擎里的 OS 沙箱状态接到 bash 上。
+
+        为什么走这里而不是构造参数：``new_engine`` 与 ``new_default_registry``
+        在三个装配点（TUI / 评测 / 团队队员）的调用顺序不一致，有的先有引擎、
+        有的先有注册中心。统一成"引擎建完之后再 attach"，三处就能写成同一行。
+        """
+        tool = self._tools.get("bash")
+        attach = getattr(tool, "attach_sandbox", None)
+        if callable(attach):
+            attach(sandbox)
+
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 

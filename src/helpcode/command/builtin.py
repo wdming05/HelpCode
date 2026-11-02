@@ -174,6 +174,31 @@ async def _cmd_worktree(ctx: CommandContext) -> None:
     ctx.host.show(text)
 
 
+_SANDBOX_USAGE = """用法：
+  /sandbox               查看当前状态
+  /sandbox on            开启并自动放行命令（不再逐条确认）
+  /sandbox confirm       开启，但仍按权限模式确认
+  /sandbox off           关闭
+  /sandbox net on|off    允许 / 禁止沙箱内访问网络
+
+说明：沙箱限制的是 bash 子进程的写入范围与联网，文件类工具走的是
+路径围栏（另一层）。开启后命令只能在项目根与临时目录写入，
+config.yaml / hooks.yaml / settings.local.yaml / skills 强制只读。"""
+
+
+async def _cmd_sandbox(ctx: CommandContext) -> None:
+    """OS 级沙箱开关。参数解析留在命令层，状态切换交给宿主。"""
+    raw = ctx.args.strip().lower()
+    if not raw:
+        ctx.host.show(ctx.host.sandbox("status", ""))
+        return
+    sub, _, rest = raw.partition(" ")
+    if sub not in ("status", "on", "confirm", "off", "net"):
+        ctx.host.show_error(f"未知子命令：{sub}\n\n{_SANDBOX_USAGE}")
+        return
+    ctx.host.show(ctx.host.sandbox(sub, rest.strip()))
+
+
 _TEAM_USAGE = """用法：
   /team create <名字> [描述]   创建团队并把当前 Agent 设为 Lead
   /team list                   列出团队（后端、成员数、活跃数）
@@ -276,6 +301,14 @@ BUILTINS: list[Command] = [
         usage="/team <create|list|info|kill|delete> [参数]",
         type=CommandType.UI_STATE,
         handler=_cmd_team,
+        arg_hint="<子命令>",
+    ),
+    Command(
+        name="sandbox",
+        description="开关 OS 级沙箱（限制 bash 子进程的写入与联网）",
+        usage="/sandbox <status|on|confirm|off|net>",
+        type=CommandType.UI_STATE,
+        handler=_cmd_sandbox,
         arg_hint="<子命令>",
     ),
     Command(

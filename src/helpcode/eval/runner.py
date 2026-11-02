@@ -234,6 +234,9 @@ class EvalRunner:
         provider = new_provider(self.provider_cfg)
         registry = new_default_registry().subset(list(EVAL_TOOLS))
         engine, _ = new_engine(str(workspace))
+        # 评测默认不开沙箱（开了会连 pytest 的临时文件都要放行），
+        # 但状态要接上：将来想验证"沙箱下的 rollout"直接改 enabled 即可。
+        registry.attach_sandbox(engine.sandbox)
         context = ContextManager(provider, workspace, self.context_window)
         agent = Agent(
             provider,

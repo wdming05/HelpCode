@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -135,6 +136,68 @@ class TextualHost:
 
     async def team(self, sub: str, args: str) -> str:
         return await self._app.run_team(sub, args)
+
+    def sandbox(self, sub: str, args: str) -> str:
+        """OS 级沙箱开关。
+
+        三档模式对应两种诉求：``on`` 是「我信任沙箱，别每条命令都问我」，
+        ``confirm`` 是「我要隔离，但关键命令仍想看一眼」。两者的差别只在
+        权限层是否自动放行，隔离强度完全一样。
+        """
+        engine = getattr(self._app, "engine", None)
+        if engine is None:
+            return "权限引擎尚未就绪，稍后再试。"
+        state = engine.sandbox
+
+        if sub == "status":
+            return self._sandbox_report(state)
+
+        if sub == "net":
+            want = args.strip().lower()
+            if want not in ("on", "off"):
+                return "用法：/sandbox net on|off"
+            state.config = replace(state.config, network_enabled=want == "on")
+            return self._sandbox_report(state)
+
+        if sub == "off":
+            state.enabled = False
+            state.auto_allow = False
+            return "沙箱已关闭，bash 恢复无隔离执行。\n\n" + self._sandbox_report(state)
+
+        # on / confirm：先确认后端真的可用，不能"显示开启但实际没有"
+        backend = state.backend
+        if backend is None:
+            return (
+                "当前平台没有对等的沙箱机制（Windows 无 sandbox-exec / bwrap），"
+                "无法开启。\n"
+                "文件类工具仍受路径围栏保护，但 bash 子进程不受限制。"
+            )
+        if not backend.available():
+            hint = (
+                "apt install bubblewrap"
+                if backend.name == "bwrap"
+                else "需要 macOS 自带的 /usr/bin/sandbox-exec"
+            )
+            return f"后端 {backend.name} 不可用（{hint}），沙箱未开启。"
+
+        state.enabled = True
+        state.auto_allow = sub == "on"
+        return self._sandbox_report(state)
+
+    def _sandbox_report(self, state) -> str:
+        cfg = state.config
+        allow = "\n".join(f"  · {p}" for p in cfg.allow_write) or "  （无）"
+        deny = "\n".join(f"  · {p}" for p in cfg.deny_write) or "  （无）"
+        head = (
+            "沙箱只包 bash 子进程；read_file / write_file 等文件工具走的是"
+            "应用层路径围栏，不受这里影响。"
+        )
+        return (
+            f"OS 沙箱：{state.describe()}\n\n"
+            f"允许写入：\n{allow}\n\n"
+            f"强制只读（优先于允许）：\n{deny}\n\n"
+            f"{head}"
+        )
 
     async def quit(self) -> None:
         await self._app.action_quit()

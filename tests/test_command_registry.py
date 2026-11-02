@@ -97,8 +97,8 @@ def test_complete_prefix():
 def test_complete_empty_prefix_lists_all():
     r = build_default_registry()
     keys = r.complete("/")
-    # 可见命令 12 条（含 ch14 /worktree、ch15 /team）+ 可见别名
-    assert len(keys) == 16
+    # 可见命令 13 条（含 ch14 /worktree、ch15 /team、ch16 /sandbox）+ 可见别名
+    assert len(keys) == 17
     assert "/exit" not in keys
 
 
@@ -137,6 +137,6 @@ def test_complete_returns_slash_prefixed():
 
 def test_default_registry_counts():
     r = build_default_registry()
-    # ch14 /worktree、ch15 /team：12 全量（含隐藏 exit）、12 可见
-    assert len(r) == 13
-    assert len(r.visible()) == 12
+    # ch14 /worktree、ch15 /team、ch16 /sandbox：13 全量（含隐藏 exit）、13 可见
+    assert len(r) == 14
+    assert len(r.visible()) == 13

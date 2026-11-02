@@ -281,6 +281,12 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
     def _base_registry(self):
         """基础工具池：内置 6 个 + MCP + load_skill + 任务工具（不含 Agent 工具）。"""
         registry = new_default_registry()
+        # OS 沙箱状态挂在权限引擎上，bash 需要同一份引用才能被 /sandbox 切换。
+        # 首次装配时 engine 可能还没建（_base_registry 会被更早的路径调到），
+        # 所以用 getattr 而不是直接访问。
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            registry.attach_sandbox(engine.sandbox)
         for tool in self.mcp_tools:
             registry.register(tool)
         if self.skill_manager is not None:

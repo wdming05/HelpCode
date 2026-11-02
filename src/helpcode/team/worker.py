@@ -92,9 +92,12 @@ async def _run(args: argparse.Namespace, prompt: str) -> int:
         provider_cfg.context_window or 128000,
         spill_subdir=session_dir / "tool-results",
     )
+    registry = new_default_registry()
+    # 队员与 Lead 共享同一套沙箱语义（默认关，由 /sandbox 控制）
+    registry.attach_sandbox(engine.sandbox)
     agent = Agent(
         provider,
-        new_default_registry(),
+        registry,
         __version__,
         engine,
         context,

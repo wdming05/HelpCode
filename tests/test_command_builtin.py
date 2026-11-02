@@ -22,6 +22,7 @@ class FakeHost:
         self.cleared = False
         self.picker_opened = False
         self.quit_called = False
+        self.sandbox_calls: list[tuple[str, str]] = []
         snap = {
             "model": "qwen3.7-max",
             "session_id": "20261024-120000-aaaa",
@@ -67,6 +68,10 @@ class FakeHost:
 
     def refresh_status(self):
         pass
+
+    def sandbox(self, sub, args):
+        self.sandbox_calls.append((sub, args))
+        return f"沙箱状态：{sub}"
 
     async def start_new_session(self):
         return self.new_sid
