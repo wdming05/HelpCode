@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "helpcode"
 version = "0.1.0"
-description = "多协议 LLM 终端对话客户端（Claude Code 风格）"
+description = "终端 AI 编程助手：ReAct 循环、工具调用、上下文压缩、多 Agent 协作与评测"
 requires-python = ">=3.12"
 dependencies = [
     "textual>=0.80",

@@ -10,7 +10,7 @@ providers:
   # ── 示例 1：OpenAI 协议（qwen / 百炼 / DeepSeek 等兼容服务）──
   - name: "qwen"
     protocol: openai
-    api_key: "sk-..."                                  # 你的 API Key
+    api_key: "${DASHSCOPE_API_KEY}"                            # 从环境变量读取，不要写明文
     model: "qwen3.7-max"                               # 模型名
     base_url: "https://.../compatible-mode/v1"         # 兼容端点；官方 OpenAI 填 null
     thinking: false                                    # openai 协议下此字段不生效
