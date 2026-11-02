@@ -22,7 +22,7 @@
 需要 Python 3.12+。
 
 ```bash
-git clone https://github.com/yiiiiim-i/HelpCode.git
+git clone https://github.com/wdming05/HelpCode.git
 cd HelpCode
 
 python -m venv .venv
@@ -108,4 +108,4 @@ helpcode eval report runs/<run-id>
 
 ## 许可
 
-未指定许可证。如需使用请先联系作者。
+[MIT](LICENSE) © 2026 Dongming Wu
