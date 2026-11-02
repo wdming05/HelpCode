@@ -1,4 +1,4 @@
-# Python
+# ---------------------------------------------------------------- Python 产物
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -8,26 +8,39 @@ __pycache__/
 build/
 dist/
 
-# HelpCode 配置（含密钥，不入库）
+# ---------------------------------------------------------------- 配置与密钥
+# 真实配置含 API key，只提交 .example 模板
 .helpcode/config.yaml
 .helpcode/settings.local.yaml
+deploy/.env
 
-# 归档的旧版本
+# ---------------------------------------------------------------- 运行时数据
+# 本机状态或纯个人数据：换台机器就失效，或是每人不同，都不该进仓库
+.helpcode/sessions/
+.helpcode/tool-results/
+.helpcode/worktrees/
+.helpcode/memory/
+.helpcode/worktree_session.json
+deploy/workspace/
+
+# ---------------------------------------------------------------- 评测产物
+# 都能由 tests/fixtures/build_mini_dataset.py 与 eval run 重建，
+# 且里面的工作区含被改坏的测试文件，入库会污染 pytest 收集
+runs/
+eval_datasets/
+
+# ---------------------------------------------------------------- 归档与临时
 _archive_v1_tools/
+hello.txt
 
-# 编辑器
+# ---------------------------------------------------------------- 编辑器与系统
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
 
-# 开发的本地文档（不提交到仓库）
+# ---------------------------------------------------------------- 本地草稿文档
+# ch03-ch05 是早期草稿；ch06 起的 spec/plan/task/checklist 随代码一起入库
 ch03-*.md
 ch04-*.md
 ch05-*.md
-# 上下文压缩的落盘文件
-.helpcode/tool-results/
-
-# 会话存档（本地数据，不入库）
-.helpcode/sessions/
-
-# ch14：Worktree 隔离目录（本地生成，不入库）
-.helpcode/worktrees/

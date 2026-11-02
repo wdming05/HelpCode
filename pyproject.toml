@@ -24,13 +24,23 @@ helpcode = "helpcode.cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
 
+[tool.pytest.ini_options]
+# runs/ 与 eval_datasets/ 是本地产物：里面是评测工作区（含测试文件），
+# 被 pytest 收进来会把「模型改坏的语法」当成项目测试失败。
+# 自定义 norecursedirs 会覆盖 pytest 默认值（默认含 .*），所以必须显式补回。
+# 漏掉 `.helpcode` 时，ch15 留下的 worktree 里有同名 test_*.py，
+# 会和 tests/ 撞 import 直接让收集崩掉。
+norecursedirs = [".*", "runs", "eval_datasets", ".venv", "__pycache__", "build", "dist", "node_modules"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.ruff]
 # 设计文档里的 Python 代码块是「说明」不是「源码」，
 # 不能让 ruff format 去改写它们（ch06 遗留下来的门禁红就是它造成的）。
-extend-exclude = ["*.md"]
+# 评测产物（runs/）与合成题仓库（eval_datasets/）是「被检查的对象」，
+# 不是源码：格式化它们会改动被测样本，破坏可复现性。
+extend-exclude = ["*.md", "runs", "eval_datasets", ".helpcode"]
 
 [tool.ruff.lint]
 # RUF012：Textual 框架要求用 BINDINGS 类属性（可变默认值属框架约定）

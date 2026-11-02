@@ -11,6 +11,12 @@ class ReadFileTool:
     read_only = True
     # ch14：支持显式工作目录（cwd 不是模型可见参数，由 Agent 注入）
     cwd_aware = True
+    # 落盘豁免：本工具的结果若被落盘，预览里会给出落盘路径，模型会再用
+    # read_file 把那个文件读回来 —— 读回来的内容照样超阈值 → 再落盘，
+    # 形成「落盘 → 读回 → 再落盘」的死循环。豁免后由下面的字符守卫兜底。
+    # 生效处：context/constants.py 的 SPILL_EXEMPT_TOOLS。
+    spillable = False
+
     description = (
         "读取指定文件的内容，返回带行号的文本，便于引用。"
         "可指定起始行 offset 与读取行数 limit；文件过长时会截断并提示。"
@@ -27,6 +33,12 @@ class ReadFileTool:
         },
         "required": ["path"],
     }
+
+    # 内部守卫（豁免落盘的前提）：单次返回必须自己保证塞不满上下文。
+    # 单行上限挡住 minified JSON / 压缩代码这类「一行几十万字符」；
+    # 总量上限挡住「limit 传了 100000」这类滥用。
+    MAX_LINE_CHARS = 2000
+    MAX_TOTAL_CHARS = 100_000
 
     def run(
         self,
@@ -50,8 +62,35 @@ class ReadFileTool:
         start = max(offset, 1)
         end = start + max(limit, 1) - 1
         selected = lines[start - 1 : end]
+        if not selected:
+            return ToolResult(
+                ok=False, content=f"错误：offset {start} 超出文件总行数 {total}"
+            )
 
-        numbered = "\n".join(f"{i + start}: {line}" for i, line in enumerate(selected))
-        if end < total:
-            numbered += f"\n(已截断：共 {total} 行，仅显示第 {start}-{end} 行)"
+        numbered_lines: list[str] = []
+        used = 0
+        long_line_cut = False
+        for i, line in enumerate(selected, start=start):
+            if len(line) > self.MAX_LINE_CHARS:
+                long_line_cut = True
+                original = len(line)
+                line = line[: self.MAX_LINE_CHARS] + (
+                    f"…（该行原有 {original} 字符，已截断）"
+                )
+            entry = f"{i}: {line}"
+            # 第一行无论多长都收下，否则 offset 对不上、模型会以为文件是空的
+            if numbered_lines and used + len(entry) > self.MAX_TOTAL_CHARS:
+                break
+            numbered_lines.append(entry)
+            used += len(entry) + 1
+
+        numbered = "\n".join(numbered_lines)
+        shown_end = start + len(numbered_lines) - 1
+        if long_line_cut:
+            numbered += f"\n(注意：超过 {self.MAX_LINE_CHARS} 字符的行已截断)"
+        if shown_end < total:
+            numbered += (
+                f"\n(已截断：共 {total} 行，本次返回第 {start}-{shown_end} 行；"
+                f"继续请用 offset={shown_end + 1})"
+            )
         return ToolResult(ok=True, content=numbered)

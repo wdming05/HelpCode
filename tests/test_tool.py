@@ -158,3 +158,40 @@ def test_register_duplicate_warns(capsys):
     assert "重名" in capsys.readouterr().err
     assert registry.get("dup") is second
     assert len(registry.names()) == 1
+
+
+def test_read_file_caps_single_long_line(tmp_path):
+    """单行超长必须截断：minified JSON 一行几十万字符，不截会一次塞爆上下文。"""
+    f = tmp_path / "min.json"
+    f.write_text("{" + "x" * 10000 + "}", encoding="utf-8")
+
+    r = ReadFileTool().run(str(f), limit=10)
+
+    assert r.ok
+    assert len(r.content) < ReadFileTool.MAX_LINE_CHARS + 200
+    assert "已截断" in r.content
+
+
+def test_read_file_caps_total_chars_and_gives_next_offset(tmp_path):
+    """总量超限时截断并给出续读 offset —— 豁免落盘后这是唯一的刹车。"""
+    f = tmp_path / "big.txt"
+    f.write_text(
+        "\n".join(f"line {i} " + "y" * 200 for i in range(2000)), encoding="utf-8"
+    )
+
+    r = ReadFileTool().run(str(f), limit=2000)
+
+    assert r.ok
+    assert len(r.content) < ReadFileTool.MAX_TOTAL_CHARS + 500
+    assert "offset=" in r.content
+
+
+def test_read_file_offset_past_eof(tmp_path):
+    """offset 超出文件尾要明确报错，而不是返回空串让模型以为文件是空的。"""
+    f = tmp_path / "a.txt"
+    f.write_text("一\n二\n", encoding="utf-8")
+
+    r = ReadFileTool().run(str(f), offset=99)
+
+    assert not r.ok
+    assert "超出" in r.content

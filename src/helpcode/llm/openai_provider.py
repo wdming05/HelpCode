@@ -26,7 +26,10 @@ def _to_openai_messages(req: Request) -> list[dict]:
             result.append(
                 {
                     "role": "assistant",
-                    "content": m.content or "",
+                    # 有 tool_calls 时 content 必须是 null，不能是空字符串。
+                    # 传 "" 会让部分兼容服务端（实测 qwen/dashscope）在后续轮次
+                    # 模仿「只说半句就停」——模型输出「我将要修改…」然后不再调工具。
+                    "content": m.content or None,
                     "tool_calls": [
                         {
                             "id": tc.id,

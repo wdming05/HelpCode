@@ -92,6 +92,9 @@ class Agent:
         auto_approve_ask: bool = False,
         approval_handler=None,
         cwd: str | None = None,
+        inbox=None,
+        allowed_tools: set[str] | None = None,
+        system_suffix: str = "",
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -117,6 +120,14 @@ class Agent:
         # 而不是靠进程 cwd——主 Agent 与后台子 Agent 在同一进程里，
         # 谁都不该去 chdir 影响别人。
         self.cwd = str(cwd) if cwd else os.getcwd()
+        # ch15：队员的收件箱。每轮循环开头取一次未读，没有未读就不产生提醒块
+        # （所以不给这个参数时提示词逐字节不变）。
+        self._inbox = inbox
+        # ch15：额外工具白名单（Coordinator Mode 用）。与 Skill 白名单取交集，
+        # 不改注册中心——授权判定仍然独立于「模型看得见什么」。
+        self._allowed_tools = allowed_tools
+        # ch15：系统提示后缀（协调者四阶段指引）。为空时不加，保证哈希不变。
+        self._system_suffix = system_suffix
         self._on_turn_end = on_turn_end
         self._note_tasks: set[asyncio.Task] = set()
         self._turn_count = 0
@@ -126,6 +137,10 @@ class Agent:
         if self._hooks is None:
             return None
         return await self._hooks.dispatch(event, payload)
+
+    def set_inbox(self, inbox) -> None:
+        """ch15：装上收件箱（队员 spawn 之后才有）。返回渲染好的消息行。"""
+        self._inbox = inbox
 
     async def run(
         self,
@@ -161,9 +176,21 @@ class Agent:
                 available_skills,
             )
         env_text = env.render()
+        # ch15：协调者模式的后缀（四阶段指引）附加在稳定段末尾
+        if self._system_suffix:
+            sys = f"{sys}\n\n{self._system_suffix}"
 
         # ch11：白名单收窄——有 Skill 激活时只露出白名单并集（恒含 load_skill）。
-        allowed = self._skills.allowed_tools() if self._skills is not None else None
+        # ch15：与协调者白名单取交集（两个都开时谁都不能突破）。
+        skill_allowed = (
+            self._skills.allowed_tools() if self._skills is not None else None
+        )
+        if self._allowed_tools is not None and skill_allowed is not None:
+            allowed = set(skill_allowed) & set(self._allowed_tools)
+        elif self._allowed_tools is not None:
+            allowed = set(self._allowed_tools)
+        else:
+            allowed = skill_allowed
 
         max_turns = self._max_turns or self.MAX_ITERATIONS
         for iteration in range(1, max_turns + 1):
@@ -186,6 +213,17 @@ class Agent:
             else:
                 tools = self.registry.export()
                 reminder = ""
+
+            # ch15：队员每轮开头取未读消息。没有未读时不拼任何东西——
+            # 空提醒块会让每一轮的提示词都不同，缓存全废。
+            incoming = self._inbox() if self._inbox is not None else None
+            if incoming:
+                block = "\n\n".join(incoming)
+                reminder = (
+                    f"{reminder}\n\n<incoming-messages>\n{block}\n</incoming-messages>"
+                    if reminder
+                    else f"<incoming-messages>\n{block}\n</incoming-messages>"
+                )
 
             # 白名单软过滤：不删 registry（授权仍走权限引擎），只收窄模型可见工具
             if allowed is not None:

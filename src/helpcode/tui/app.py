@@ -38,6 +38,9 @@ from ..subagent import (
     TaskManager,
     TaskStopTool,
 )
+from ..team import COORDINATOR_TOOLS, coordinator_prompt
+from ..team.service import TeamService
+from ..team.tools import TeamCreateTool
 from ..tool import new_default_registry
 from ..worktree import ExitAction, WorktreeHasChangesError
 from . import SessionState
@@ -94,6 +97,10 @@ class InputArea(TextArea):
             asyncio.create_task(app.submit(self.text))
 
 
+# 子 Agent / 队员的审批最多等主对话空闲这么久；等不到按拒绝处理，绝不无限挂住
+_APPROVAL_WAIT_SECONDS = 120.0
+
+
 class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
     """HelpCode 终端界面。"""
 
@@ -145,6 +152,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         hooks=None,
         catalog=None,
         worktrees=None,
+        teams=None,
+        coordinator: bool = False,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -182,6 +191,10 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         # ch14：Worktree 管理器（非 git 仓库时为 None）+ 当前主 Agent 的工作目录
         self.worktrees = worktrees
         self.worktree_cwd: str | None = None
+        # ch15：团队管理器（cli 装配）+ 团队服务（provider 选定后才能建，见 _setup_agent）
+        self.team_manager = teams
+        self.team_service = None
+        self.coordinator = coordinator
         self.last_usage = None  # 最近一次请求的 token 用量（/status 用）
         self.cancel_event = asyncio.Event()
         self.mode = Mode.DEFAULT
@@ -192,6 +205,8 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         self._timer = None
         self._pending_request = None
         self._approve_cursor = 0
+        # 子 Agent 审批串行锁：同一时刻只弹一个（主对话可能自己也在弹）
+        self._approval_lock = asyncio.Lock()
         # 恢复的会话若已贴窗口，压缩在后台跑；第一轮请求前必须等它收尾（AC16）
         self._restore_compress_task = None
 
@@ -279,11 +294,31 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         return registry
 
     def _build_registry(self):
-        """主 Agent 的工具池 = 基础工具池 + Agent 工具。"""
+        """主 Agent 的工具池 = 基础工具池 + Agent 工具 + 团队工具。
+
+        `TeamCreate` 恒在（第一次建队要有入口）；协作工具跟着「有没有活跃团队」
+        出现——没团队时露出任务表只会让模型乱用（F22）。
+        """
         registry = self._base_registry()
         if self.subagent_runner is not None:
-            registry.register(AgentTool(self.subagent_runner))
+            registry.register(AgentTool(self.subagent_runner, self.team_service))
+        if self.team_service is not None:
+            # TeamCreate 恒在：它既是第一次建队的入口，也允许 Lead 再开一个团队
+            registry.register(TeamCreateTool(self.team_service))
+            if self.team_service.active_team is not None:
+                # ch13 的 TaskList/TaskGet 与团队版同名：有团队时以团队任务表为准
+                names = [
+                    n for n in registry.names() if n not in ("TaskList", "TaskGet")
+                ]
+                registry = registry.subset(names)
+                for tool in self.team_service.lead_tools():
+                    registry.register(tool)
         return registry
+
+    def _refresh_tools(self) -> None:
+        """团队建/删之后重建工具列表，让协作工具立刻出现或消失。"""
+        if self.agent is not None:
+            self.agent.registry = self._build_registry()
 
     def _context_window(self) -> int:
         """窗口值取自配置对象而非 provider：provider 只该管「怎么发请求」。"""
@@ -302,6 +337,11 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
 
     def _build_agent(self, on_turn_end, context: ContextManager | None = None):
         """构造一个 Agent；不共享 ContextManager（独立对话要有独立锚点）。"""
+        extra = {}
+        if self.coordinator:
+            # ch15：协调者模式——只留调度与读类工具，并追加四阶段指引
+            extra["allowed_tools"] = set(COORDINATOR_TOOLS)
+            extra["system_suffix"] = coordinator_prompt()
         return Agent(
             self.provider,
             self._build_registry(),
@@ -314,6 +354,7 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             hooks=self.hooks,
             # ch14：主 Agent 的工作目录可能是某个 Worktree（/worktree create 之后）
             cwd=self.worktree_cwd or os.getcwd(),
+            **extra,
         )
 
     async def _fire_hook(self, event: HookEvent, payload: dict):
@@ -458,6 +499,107 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
         """把一条说明挂到下一轮用户消息前（复用后台任务通知的通道）。"""
         self._pending_notices.append(text)
 
+    # ------------------------------------------------------------ Team（ch15）
+
+    async def run_team(self, sub: str, args: str) -> str:
+        """`/team` 的实现：解析参数、调服务、返回文本。"""
+        if self.team_service is None:
+            return "Team 未启用（需要先选定 provider，且团队目录可写）"
+        if sub == "create":
+            return await self._team_create(args)
+        if sub == "list":
+            return self._team_list()
+        if sub == "info":
+            return self._team_info(args)
+        if sub == "kill":
+            return await self._team_kill(args)
+        if sub == "delete":
+            return await self._team_delete(args)
+        return f"未知子命令：{sub}（可用：create / list / info / kill / delete）"
+
+    async def _team_create(self, args: str) -> str:
+        parts = args.split(maxsplit=1)
+        if not parts:
+            return "用法：/team create <名字> [描述]"
+        name = parts[0]
+        desc = parts[1] if len(parts) > 1 else ""
+        try:
+            team = await asyncio.to_thread(self.team_service.create_team, name, desc)
+        except Exception as e:
+            return f"创建团队失败：{e}"
+        self._refresh_tools()
+        return (
+            f"已创建团队「{team.name}」（目录名 {team.sanitized_name}，后端 {team.backend}）\n"
+            "协作工具已加入当前会话；用 Agent 工具带 team_name 派队员。"
+        )
+
+    def _team_list(self) -> str:
+        teams = self.team_manager.list()
+        if not teams:
+            return "（无团队；用 /team create <名字> 创建）"
+        current = self.team_service.active_team
+        lines: list[str] = []
+        for team in teams:
+            active = sum(1 for m in team.members if m.is_active is not False)
+            mark = (
+                " *当前"
+                if current and current.sanitized_name == team.sanitized_name
+                else ""
+            )
+            lines.append(
+                f"- {team.name}（{team.sanitized_name}）[后端 {team.backend}]{mark}\n"
+                f"  成员 {len(team.members)}（活跃 {active}）"
+            )
+        return "\n".join(lines)
+
+    def _team_info(self, args: str) -> str:
+        name = args.strip()
+        team = self.team_manager.get(name) if name else self.team_service.active_team
+        if team is None:
+            return f"未找到团队：{name or '（当前无团队）'}"
+        lines = [f"团队「{team.name}」（{team.sanitized_name}）后端 {team.backend}"]
+        if team.description:
+            lines.append(f"目标：{team.description}")
+        for member in team.members:
+            state = "活跃" if member.is_active is not False else "空闲"
+            lines.append(f"- {member.name} [{state}]")
+            if member.agent_type:
+                lines.append(f"  角色：{member.agent_type}")
+            if member.branch:
+                lines.append(f"  分支：{member.branch}")
+            if member.worktree_path:
+                lines.append(f"  工作目录：{member.worktree_path}")
+            if member.plan_mode_required:
+                lines.append("  需 Lead 审批计划")
+        return "\n".join(lines)
+
+    async def _team_kill(self, args: str) -> str:
+        member = args.strip()
+        if not member:
+            return "用法：/team kill <成员>"
+        try:
+            ok = await self.team_service.kill(member)
+        except Exception as e:
+            return f"终止失败：{e}"
+        return f"已终止成员 {member}" if ok else f"未找到成员：{member}"
+
+    async def _team_delete(self, args: str) -> str:
+        parts = args.split()
+        force = "--force" in parts
+        name = next((p for p in parts if not p.startswith("--")), "")
+        if not name:
+            return "用法：/team delete <名字> [--force]"
+        try:
+            report = await asyncio.to_thread(self.team_service.delete_team, name, force)
+        except Exception as e:
+            return f"删除团队失败：{e}"
+        self._refresh_tools()
+        removed = "、".join(report["removed_members"]) or "（无队员）"
+        text = f"已删除团队「{report['team']}」，清理成员：{removed}"
+        if report["warnings"]:
+            text += "\n" + "\n".join(f"告警：{w}" for w in report["warnings"])
+        return text
+
     def _parent_context(self) -> ParentContext:
         """把父侧能力打包给子 Agent 运行器。"""
         return ParentContext(
@@ -489,28 +631,55 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
             self.log.debug("写后台任务日志失败", exc_info=True)
 
     async def _subagent_approval(self, call, reason) -> Outcome:
-        """子 Agent 的 Ask 升级到主 TUI：复用 APPROVING 弹窗，返回用户选择。"""
-        future = asyncio.get_event_loop().create_future()
-        request = PermissionRequest(
-            tool_call=call,
-            friendly_name=friendly_name(call.name),
-            preview=_preview_args(call.input),
-            reason=f"[来自 SubAgent] {reason}",
-            respond=future,
-        )
-        prev_state = self.state
-        self._pending_request = request
-        self._approve_cursor = 0
-        self.state = SessionState.APPROVING
-        self.set_focus(None)
-        self.query_one("#streaming", Static).update(
-            render_permission_request(request, 0)
-        )
-        try:
-            return await future
-        finally:
-            self._pending_request = None
-            self.state = prev_state
+        """子 Agent / 队员的 Ask 升级到主 TUI：复用 APPROVING 弹窗，返回用户选择。
+
+        两条保护：
+
+        1. **串行**——同一时刻只弹一个。队员在后台跑时主 Agent 可能自己也在
+           弹审批，两个请求抢同一块 `#streaming` 会把界面与 state 都搞乱。
+        2. **等主对话不忙**——`prev_state` 必须在等完之后再取。早先直接取，
+           队员在 STREAMING 期间弹窗、结束后把 state 还原成 STREAMING，
+           主对话就再也不回 IDLE（按钮全失效）。等不到就按拒绝处理，
+           绝不把队员无限期挂住。
+        """
+        delay = 0.1
+        remaining = _APPROVAL_WAIT_SECONDS
+        async with self._approval_lock:
+            busy_states = (
+                SessionState.STREAMING,
+                SessionState.APPROVING,
+                SessionState.SELECTING,
+                SessionState.RESUMING,
+                SessionState.COMPLETING,
+            )
+            while self.state in busy_states:
+                if remaining <= 0:
+                    self.log.debug("子 Agent 审批等待超时，按拒绝处理")
+                    return Outcome.DENY_ONCE
+                await asyncio.sleep(delay)
+                remaining -= delay
+
+            future = asyncio.get_event_loop().create_future()
+            request = PermissionRequest(
+                tool_call=call,
+                friendly_name=friendly_name(call.name),
+                preview=_preview_args(call.input),
+                reason=f"[来自 SubAgent] {reason}",
+                respond=future,
+            )
+            prev_state = self.state
+            self._pending_request = request
+            self._approve_cursor = 0
+            self.state = SessionState.APPROVING
+            self.set_focus(None)
+            self.query_one("#streaming", Static).update(
+                render_permission_request(request, 0)
+            )
+            try:
+                return await future
+            finally:
+                self._pending_request = None
+                self.state = prev_state
 
     def _setup_agent(self) -> None:
         """provider 确定后，构造权限引擎与 Agent。
@@ -533,6 +702,14 @@ class HelpCodeApp(StreamMixin, SelectMixin, ResumeMixin, App):
                 self.task_manager,
                 self._parent_context(),
                 worktrees=self.worktrees,
+            )
+        # ch15：团队服务要等 runner 就位（它复用 runner 建队员 Agent）
+        self.team_service = None
+        if self.team_manager is not None and self.subagent_runner is not None:
+            self.team_service = TeamService(
+                self.team_manager,
+                self.subagent_runner,
+                mode_getter=lambda: self.mode,
             )
 
         self.agent = self._build_agent(

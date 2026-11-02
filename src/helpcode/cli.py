@@ -4,6 +4,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import yaml
+
 from .command import DuplicateCommandError, build_default_registry
 from .config import Config, ConfigError, load
 from .hook import HookEngine, load_hooks
@@ -22,6 +24,8 @@ from .skill import (
     validate_whitelists,
 )
 from .subagent import load_catalog
+from .team import Manager as TeamManager
+from .team.coordinator import is_coordinator_mode
 from .tool import new_default_registry
 from .tui.app import HelpCodeApp
 from .worktree import Manager, NotARepoError
@@ -31,6 +35,15 @@ CONFIG_PATH = ".helpcode/config.yaml"
 
 def main() -> None:
     """装配与启动 HelpCode。"""
+    # 子命令分流：`helpcode eval ...` 走评测，其余（含无参数）进 TUI。
+    # 用 sys.argv 直判断而不是 argparse：无参数启动 TUI 是主路径，
+    # 不该被一个子命令解析器改写行为。
+    argv = sys.argv[1:]
+    if argv and argv[0] == "eval":
+        from .eval.cli import eval_main
+
+        sys.exit(eval_main(argv[1:]))
+
     try:
         cfg = load(CONFIG_PATH)
     except ConfigError as e:
@@ -122,6 +135,10 @@ async def _run(cfg: Config) -> None:
         # 8) ch14：Worktree 管理器。非 git 仓库只降级，不阻断启动
         worktrees = _build_worktrees(root)
 
+        # 9) ch15：团队管理器 + 协调者开关（双锁：配置能力位 + 环境变量）
+        teams = _build_teams(root, worktrees)
+        coordinator = _coordinator_enabled(root)
+
         app = HelpCodeApp(
             cfg.providers,
             mcp_tools,
@@ -140,6 +157,8 @@ async def _run(cfg: Config) -> None:
             hooks=hook_engine,
             catalog=catalog,
             worktrees=worktrees,
+            teams=teams,
+            coordinator=coordinator,
         )
         await app.run_async()
     finally:
@@ -170,6 +189,34 @@ def _build_worktrees(root: Path):
     except Exception as e:  # 清理失败不该阻断启动
         print(f"（Worktree 清理跳过）{e.__class__.__name__}: {e}", file=sys.stderr)
     return wt_manager
+
+
+def _build_teams(root: Path, worktrees):
+    """团队管理器。没有 Worktree 就没有队员隔离，直接降级。"""
+    if worktrees is None:
+        print("（Team 未启用）需要 Worktree 支持", file=sys.stderr)
+        return None
+    try:
+        return TeamManager(Path.home(), worktrees)
+    except Exception as e:
+        print(f"（Team 未启用）{e}", file=sys.stderr)
+        return None
+
+
+def _coordinator_enabled(root: Path) -> bool:
+    """双锁：配置文件里的能力位 + 环境变量 ``HELPCODE_COORDINATOR_MODE``。"""
+    path = root / ".helpcode" / "config.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    features = raw.get("features") if isinstance(raw, dict) else None
+    flag = False
+    if isinstance(features, dict):
+        flag = bool(
+            features.get("coordinator_mode") or features.get("COORDINATOR_MODE")
+        )
+    return is_coordinator_mode(flag)
 
 
 def _build_conversation(root: Path, latest):
