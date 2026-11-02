@@ -12,7 +12,6 @@ dist/
 # 真实配置含 API key，只提交 .example 模板
 .helpcode/config.yaml
 .helpcode/settings.local.yaml
-deploy/.env
 
 # ---------------------------------------------------------------- 运行时数据
 # 本机状态或纯个人数据：换台机器就失效，或是每人不同
@@ -21,7 +20,13 @@ deploy/.env
 .helpcode/worktrees/
 .helpcode/memory/
 .helpcode/worktree_session.json
-deploy/workspace/
+
+# ---------------------------------------------------------------- 本地专用
+# deploy/ 与 examples/ 是本机使用的东西（含部署密钥、本机示例）；
+# run.bat 是本机启动脚本，里面的绝对路径换台机器就失效。
+/deploy/
+/examples/
+/run.bat
 
 # ---------------------------------------------------------------- 评测产物
 # 都能由 tests/fixtures/build_mini_dataset.py 与 eval run 重建，

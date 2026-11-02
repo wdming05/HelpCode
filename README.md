@@ -106,14 +106,6 @@ helpcode eval run --dataset eval_datasets/mini.jsonl --driver local
 helpcode eval report runs/<run-id>
 ```
 
-## 部署（可选）
-
-`deploy/` 里是 Docker + ttyd 的远程访问方案：把终端界面套进浏览器，供自己远程使用。
-详见 `deploy/README.md`。
-
-这不是 Web 版——它只是给 TUI 加了一层浏览器外壳，**必须私有部署**（密码 + HTTPS），
-因为一旦公开，等于把服务器 shell 交给每一个能打开页面的人。
-
 ## 许可
 
 未指定许可证。如需使用请先联系作者。
