@@ -81,7 +81,7 @@ def test_agent_no_whitelist_keeps_all():
     provider, agent = _agent(skills=_FakeSkills(allowed=None))
     _run(agent)
     names = [t["name"] for t in provider.requests[0].tools]
-    assert len(names) == 6  # 全部内置工具
+    assert len(names) == 8  # 全部内置工具（含 snip / search_history）
 
 
 def test_agent_plan_narrow(tmp_path, monkeypatch):

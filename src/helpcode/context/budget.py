@@ -12,9 +12,13 @@ from pathlib import Path
 
 from ..conversation import Conversation
 from ..llm import Message
-from . import resume, spill
+from . import micro, resume, spill
 from .constants import (
+    BUFFER_TOTAL,
+    HARD_WATERMARK,
     KEEP_TAIL_MIN_MSGS,
+    MICRO_CHAIN_MIN,
+    MICRO_WATERMARK,
     MIN_SUMMARIZE_MSGS,
     MIN_WINDOW_RATIO,
     SAFETY_AUTO,
@@ -75,6 +79,10 @@ class ContextManager:
         self.fuse_blown = False
         self._notified_disabled = False
 
+        # 有效窗口 = 原始窗口 − 33K 缓冲（下限保护：小窗口不退化成负值）
+        self.effective_window = max(
+            context_window - BUFFER_TOTAL, int(context_window * 0.5)
+        )
         self.auto_enabled = context_window >= SAFETY_AUTO * MIN_WINDOW_RATIO
         if not self.auto_enabled:
             logger.warning(
@@ -114,10 +122,14 @@ class ContextManager:
     # ------------------------------------------------------------ 判断
 
     def should_compress(self, conv: Conversation) -> bool:
-        """纯估算，不碰 LLM；供 agent 在压缩前先发一个 start 事件。"""
+        """纯估算，不碰 LLM；供 agent 在压缩前先发一个 start 事件。
+
+        只预告 L5 全局硬摘要（≥80% 有效窗口）——L4 微压缩是轻量静默动作，
+        不值得 start/done 两段事件。
+        """
         if not self.auto_enabled:
             return False
-        return self.estimate(conv) >= self.context_window - SAFETY_AUTO
+        return self.estimate(conv) >= self.effective_window * HARD_WATERMARK
 
     def has_room_after_compress(self, tokens_after: int) -> bool:
         """紧急压缩后是否还值得重试：贴着窗口就说明压不动，重试必然再撞。"""
@@ -130,7 +142,10 @@ class ContextManager:
     ) -> CompressReport:
         """每次 API 请求之前：先落盘，再按需摘要。"""
         # 扫描 conv 里的工具结果，超过阈值的写到磁盘，对话里只留预览和路径。
-        spilled, warnings = spill.apply(conv, self.root, self._spill_subdir)
+        # L1 阈值用有效窗口比例（自适应不同窗口的模型）。
+        spilled, warnings = spill.apply(
+            conv, self.root, self._spill_subdir, self.effective_window
+        )
        
         if spilled:
             self.reset_anchor()
@@ -164,7 +179,13 @@ class ContextManager:
                 )
             return report
 
-        if total < self.context_window - SAFETY_AUTO:
+        # L4 局部微压缩：达 55% 有效窗口时，摘要最早的大工具链（静默轻量）
+        total = await self._maybe_micro_compress(conv, cancel_event, report, total)
+        if report.cancelled:
+            return report
+
+        # L5 全局硬摘要：达 80% 有效窗口时，全量重写摘要
+        if total < self.effective_window * HARD_WATERMARK:
             return report
 
         if self.fuse_blown:
@@ -182,6 +203,68 @@ class ContextManager:
         return await self._compress(
             conv, messages, total, cancel_event, tool_names, report
         )
+
+    async def _maybe_micro_compress(
+        self,
+        conv: Conversation,
+        cancel_event,
+        report: CompressReport,
+        total: int,
+    ) -> int:
+        """L4 局部微压缩：水位 ≥55% 时摘要最早的大工具链。返回压后的 total。
+
+        失败**静默降级**（返回原 total），由 L5 硬摘要兜底——L4 是「免费的轻量优化」，
+        不值得为它计入熔断。只动工具链、不碰用户/助手自然语言，保住对话连贯性。
+        """
+        if total < self.effective_window * MICRO_WATERMARK:
+            return total
+
+        messages = conv.messages()
+        chains = micro.find_tool_chains(messages)
+        if not chains:
+            return total
+
+        start, end = chains[0]  # 最早的一条链
+        if micro.chain_tokens(messages, chains[0]) < MICRO_CHAIN_MIN:
+            return total
+
+        chain = messages[start : end + 1]
+        try:
+            summary = await self._summarize_chain(chain, cancel_event)
+        except CompressCancelled:
+            report.cancelled = True
+            return total
+        except Exception as e:
+            logger.warning("L4 局部微压缩失败：%s", e)
+            return total
+
+        if not summary:
+            return total
+
+        new_messages = micro.replace_chain(messages, start, end, summary)
+        conv.rewrite(new_messages)
+        self.reset_anchor()  # 历史变了，锚点作废，下次由 API 重建
+        after = self._estimate_total(new_messages)
+        report.tokens_after = after
+        report.notice = f"已局部微压缩：摘要早期工具链（{end - start + 1} 条 → 1 条）"
+        return after
+
+    async def _summarize_chain(
+        self, chain: list[Message], cancel_event
+    ) -> str | None:
+        """调 LLM 把一条工具链摘要成一段短文本；不可解析返回 None。"""
+        chunk = micro.serialize_chain(chain)
+        raw = ""
+        async for ev in self.provider.stream(micro.build_micro_request(chunk)):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CompressCancelled
+            if ev.err is not None:
+                raise ev.err
+            if ev.text:
+                raw += ev.text
+            if ev.done:
+                break
+        return micro.parse_micro_summary(raw)
 
     async def compact_now(
         self,
@@ -310,6 +393,8 @@ class ContextManager:
         tool_names: list[str],
     ) -> Message:
         resume_text = resume.build_resume(chunk, tool_names)
+        # L5 附件通道：从文件系统读可靠快照（git 分支/改动），不走 LLM、不压缩
+        attach = resume.snapshot_system_state(self.root)
         content = (
             "<context_summary>\n"
             f"{summary}\n"
@@ -318,4 +403,6 @@ class ContextManager:
             "摘要会丢失代码细节与精确数值。\n"
             f"{resume_text}"
         )
+        if attach:
+            content += f"\n\n[状态附件]\n{attach}"
         return Message(role="user", content=content)

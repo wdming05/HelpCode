@@ -175,22 +175,29 @@ def _groups(messages: list[Message]) -> list[tuple[int, int]]:
 async def summarize(provider, messages: list[Message], cancel_event=None) -> str | None:
     """生成摘要；返回 None 表示「模型输出不可解析」（上层计入熔断）。
 
-    摘要请求自身也可能超窗口，所以带「丢最老一组 → 重试」的循环，
+    摘要请求自身也可能超窗口，所以带「丢中间最老一组 → 重试」的循环，
     上限 PTL_RETRY_LIMIT 次，绝不无限重试。
+
+    **groups[0]（用户原始诉求）永不丢**：它是整份摘要的锚点，一旦被丢，
+    摘要模型就不知道「用户到底要什么」。
     """
     groups = _groups(messages)
-    skip = 0  # 从第几组开始纳入
+    if not groups:
+        return None
+    head = groups[0]  # 第一组：用户原始诉求，永远保留在 chunk 最前
+    skip = 1          # 从第 1 组开始纳入；撞墙时递增，丢「中间最老」的一组
     omitted_msgs = 0
 
     last_exc: Exception | None = None
     for _attempt in range(PTL_RETRY_LIMIT + 1):
-        start = groups[skip][0] if skip < len(groups) else len(messages)
-        chunk = ""
+        parts = [_serialize(messages[head[0] : head[1]])]  # 原始诉求永远在最前
         if omitted_msgs:
-            chunk += (
-                f"（更早的 {omitted_msgs} 条消息因超出上下文被省略，未纳入本次摘要）\n"
+            parts.append(
+                f"（中间有 {omitted_msgs} 条消息因超出上下文被省略，未纳入本次摘要）"
             )
-        chunk += _serialize(messages[start:])
+        if skip < len(groups):
+            parts.append(_serialize(messages[groups[skip][0] :]))
+        chunk = "\n".join(parts)
 
         raw = ""
         try:
@@ -206,7 +213,7 @@ async def summarize(provider, messages: list[Message], cancel_event=None) -> str
         except CompressCancelled:
             raise
         except Exception as e:
-            if not is_context_too_long(e) or skip >= len(groups) - 1:
+            if not is_context_too_long(e) or skip >= len(groups):
                 raise
             last_exc = e
             omitted_msgs += groups[skip][1] - groups[skip][0]

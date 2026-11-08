@@ -9,6 +9,7 @@ from helpcode.context import CompressReport
 
 class NullContext:
     context_window = 128000
+    effective_window = 128000  # 与 context_window 相同 → 投影不触发（测试行为不变）
 
     def estimate(self, conv):
         return 0

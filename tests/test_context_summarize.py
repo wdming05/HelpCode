@@ -167,7 +167,7 @@ def test_summarize_returns_none_when_unparseable():
     assert _run(summarize.summarize(provider, _plain(4))) is None
 
 
-def test_ptl_retry_drops_oldest_group():
+def test_ptl_retry_keeps_first_group():
     provider = FakeProvider(
         [
             ContextLengthExceeded("prompt is too long"),
@@ -180,10 +180,11 @@ def test_ptl_retry_drops_oldest_group():
 
     assert parsed is not None
     assert provider.call_count == 3
-    # 第二次起带上省略提示，且被丢的是最老的消息（第0条不在正文里）
+    # 第二次起带上省略提示；丢的是「中间最老」的第1条，第0条（原始诉求）保留
     second = provider.requests[1].messages[0].content
     assert "被省略" in second
-    assert "第0条" not in second
+    assert "第0条" in second          # 原始诉求保留
+    assert "第1条" not in second      # 丢的是中间最老的一组
     assert "第2条" in second
 
 

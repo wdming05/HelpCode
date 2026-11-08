@@ -23,6 +23,7 @@ F2P_FAILED = "f2p_failed"
 P2P_BROKEN = "p2p_broken"
 JUDGE_ERROR = "judge_error"
 NO_TESTS = "no_tests"
+OVER_MODIFIED = "over_modified"
 
 
 @dataclass
@@ -58,9 +59,12 @@ def _score(
 
 
 def judge(inst: Instance, outcome: TestOutcome, patch: str) -> Verdict:
-    """按顺序判定：执行错误 → 空补丁 → 只改测试 → F2P → P2P → resolved。"""
+    """按顺序判定：执行错误 → （无需修改）→ 空补丁 → 只改测试 → F2P → P2P → resolved。"""
     if outcome.error:
         return Verdict(False, JUDGE_ERROR, outcome.error)
+
+    if inst.no_change:
+        return _judge_no_change(inst, outcome, patch)
 
     if is_empty(patch):
         return Verdict(False, EMPTY_PATCH, "模型没有产出任何改动")
@@ -100,6 +104,41 @@ def judge(inst: Instance, outcome: TestOutcome, patch: str) -> Verdict:
         resolved=True,
         reason=RESOLVED,
         detail="目标测试全过且无回归",
+        f2p_total=f2p_total,
+        f2p_passed=f2p_pass,
+        p2p_total=p2p_total,
+        p2p_passed=p2p_pass,
+    )
+
+
+def _judge_no_change(inst: Instance, outcome: TestOutcome, patch: str) -> Verdict:
+    """「无需修改」题：patch 为空 且 P2P 全过 才算 resolved。
+
+    与普通题相反：正确的行为是「不改」。模型做了任何改动都算过度修改，
+    即使测试仍然全绿也判失败——克制力是这类题要测的东西。
+    """
+    if not is_empty(patch):
+        return Verdict(False, OVER_MODIFIED, "此题无需修改，模型却做了改动")
+
+    f2p_pass, f2p_total, p2p_pass, p2p_total, _ = _score(inst, outcome)
+    if f2p_total == 0 and p2p_total == 0:
+        return Verdict(False, NO_TESTS, "题集没有给 FAIL_TO_PASS / PASS_TO_PASS")
+
+    if p2p_pass < p2p_total:
+        return Verdict(
+            False,
+            P2P_BROKEN,
+            f"回归：{p2p_total - p2p_pass} 个原本通过的测试挂了",
+            f2p_total=f2p_total,
+            f2p_passed=f2p_pass,
+            p2p_total=p2p_total,
+            p2p_passed=p2p_pass,
+        )
+
+    return Verdict(
+        True,
+        RESOLVED,
+        "正确：未做任何改动",
         f2p_total=f2p_total,
         f2p_passed=f2p_pass,
         p2p_total=p2p_total,

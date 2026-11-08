@@ -19,6 +19,7 @@ dist/
 .helpcode/tool-results/
 .helpcode/worktrees/
 .helpcode/memory/
+.helpcode/traces/
 .helpcode/worktree_session.json
 
 # ---------------------------------------------------------------- 本地专用
@@ -53,3 +54,4 @@ Thumbs.db
 #
 TEAM-QA.md
 EVAL-FLOW.md
+docs/

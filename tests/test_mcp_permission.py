@@ -113,15 +113,15 @@ def test_blacklist_still_hits_builtin_bash(tmp_path, monkeypatch):
 
 
 def test_registry_order_and_read_only_lookup():
-    """内置 6 个在前、MCP 在后；is_read_only 对远端工具同样生效。"""
+    """内置 8 个在前、MCP 在后；is_read_only 对远端工具同样生效。"""
     registry: Registry = new_default_registry()
     builtin = registry.names()
-    assert len(builtin) == 6
+    assert len(builtin) == 8
 
     registry.register(_remote("echo", "peek", read_only=True))
     registry.register(_remote("echo", "write", read_only=False))
 
-    assert registry.names()[:6] == builtin
+    assert registry.names()[:8] == builtin
     assert registry.is_read_only("mcp__echo__peek") is True
     assert registry.is_read_only("mcp__echo__write") is False
     assert registry.get("mcp__echo__peek") is not None

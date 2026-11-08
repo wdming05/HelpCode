@@ -99,7 +99,7 @@ def test_agent_injects_cwd(tmp_path):
         _P(), new_default_registry(), "test", engine, NullContext(), cwd=str(tmp_path)
     )
     call = ToolCall(id="c1", name="read_file", input={"path": "z.txt"})
-    result = asyncio.run(agent._execute_one(call))
+    result = asyncio.run(agent._execute_one(call, Conversation()))
     assert result.ok and "注入成功" in result.content
 
 

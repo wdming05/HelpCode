@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from . import prompt
 from .context import CompressInfo, ContextManager
+from .context.project import project_view
 from .conversation import Conversation
 from .hook.events import HookEvent
 from .llm import (
@@ -394,7 +395,7 @@ class Agent:
                 ToolResult(ok=False, content="(未执行)") for _ in tool_calls
             ]
             async for ev in self._execute_calls(
-                tool_calls, mode, cancel_event, results
+                tool_calls, mode, cancel_event, results, conv
             ):
                 yield ev
             call_ids: dict[str, str] = {}
@@ -469,8 +470,11 @@ class Agent:
         out: dict,
     ) -> AsyncIterator[AgentEvent]:
         """组装 Request 并消费一轮流；yield 事件，收集结果写入 out。"""
+        # L3 读时投影：只发「最近 effective_window token」的视图，不改 conv 历史。
+        # 投影只读 → Prompt Cache 前缀稳定；有折叠时视图开头带折叠提示。
+        view = project_view(conv.messages(), self.context.effective_window)
         req = Request(
-            messages=conv.messages(),
+            messages=view,
             tools=tools,
             system=System(stable=sys, environment=env_text),
             reminder=reminder,
@@ -549,6 +553,7 @@ class Agent:
         mode: Mode,
         cancel_event: asyncio.Event,
         results: list[ToolResult],
+        conv: Conversation,
     ) -> AsyncIterator[AgentEvent]:
         """批次循环内权限检查 + 并发/串行执行；yield permission_request。"""
         i = 0
@@ -582,7 +587,9 @@ class Agent:
                         to_run.append(k)
                 try:
                     gathered = await asyncio.wait_for(
-                        asyncio.gather(*[self._execute_one(calls[k]) for k in to_run]),
+                        asyncio.gather(
+                            *[self._execute_one(calls[k], conv) for k in to_run]
+                        ),
                         timeout=self.BATCH_TIMEOUT,
                     )
                 except TimeoutError:
@@ -608,7 +615,7 @@ class Agent:
                 if decision is Decision.DENY:
                     results[i] = ToolResult(ok=False, content=reason, is_error=True)
                 elif decision is Decision.ALLOW:
-                    results[i] = await self._execute_one(calls[i])
+                    results[i] = await self._execute_one(calls[i], conv)
                 else:  # ASK
                     outcome = None
                     if self._auto_approve_ask:
@@ -634,9 +641,9 @@ class Agent:
                             persist_local_allow(self.engine, calls[i])
                         except Exception:
                             logger.warning("持久化永久放行规则失败", exc_info=True)
-                        results[i] = await self._execute_one(calls[i])
+                        results[i] = await self._execute_one(calls[i], conv)
                     elif outcome is Outcome.ALLOW_ONCE:
-                        results[i] = await self._execute_one(calls[i])
+                        results[i] = await self._execute_one(calls[i], conv)
                     else:  # DENY_ONCE
                         results[i] = ToolResult(
                             ok=False, content="用户拒绝该操作", is_error=True
@@ -671,7 +678,7 @@ class Agent:
             return
         out["outcome"] = future.result()
 
-    async def _execute_one(self, call: ToolCall) -> ToolResult:
+    async def _execute_one(self, call: ToolCall, conv: Conversation) -> ToolResult:
         """执行一个工具调用；未知工具/异常均包成 ToolResult。"""
         start = time.perf_counter()
         tool = self.registry.get(call.name)
@@ -688,6 +695,10 @@ class Agent:
             kwargs = dict(call.input)
             if getattr(tool, "cwd_aware", False):
                 kwargs["cwd"] = self.cwd
+            # L2/L3 配套工具（snip / search_history）需要访问当前会话：
+            # 把 conv 注入为隐藏参数，schema 不变。
+            if getattr(tool, "conv_aware", False):
+                kwargs["conv"] = conv
             # 异步工具（MCP 等）直接在事件循环里跑：它们的会话绑定 loop，
             # 丢进线程池调用必然失败。
             if isinstance(tool, AsyncTool):

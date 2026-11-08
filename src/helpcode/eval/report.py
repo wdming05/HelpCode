@@ -28,6 +28,7 @@ REASON_LABEL = {
     "prepare_failed": "工作区准备失败",
     "patch_failed": "补丁收集失败",
     "no_tests": "题集没给测试清单",
+    "over_modified": "过度修改（无需修改题）",
 }
 
 
@@ -59,6 +60,14 @@ def summarize(results: list[dict]) -> dict:
     # 这是 harness 鲁棒性的指标，和题目难度无关，单独报出来。
     retried = sum(1 for r in results if int(r.get("attempts") or 1) > 1)
 
+    # 多采样指标：
+    # - pass@1：trial 级成功率 = 通过 trial 数 / 总 trial 数
+    # - pass^3：3 次采样全部通过的题占比（稳定性）
+    trial_lists = [r.get("trial_resolved") or [] for r in results]
+    n_trials = sum(len(x) for x in trial_lists)
+    n_trial_passed = sum(sum(x) for x in trial_lists)
+    all_three = sum(1 for x in trial_lists if len(x) == 3 and all(x))
+
     return {
         "total": total,
         "resolved": len(resolved),
@@ -66,6 +75,8 @@ def summarize(results: list[dict]) -> dict:
         "env_failed": len(env_failed),
         "resolved_rate": round(len(resolved) / total, 4) if total else 0.0,
         "resolved_rate_valid": round(len(resolved) / valid, 4) if valid else 0.0,
+        "pass_at_1": round(n_trial_passed / n_trials, 4) if n_trials else 0.0,
+        "pass_pow_3": round(all_three / total, 4) if total else 0.0,
         "reasons": dict(reasons.most_common()),
         "tokens_in": t_in,
         "tokens_out": t_out,
@@ -93,6 +104,9 @@ def render_markdown(summary: dict, results: list[dict], *, title: str = "") -> s
     lines.append(
         f"| 解决的题 | {summary['resolved']}（{summary['resolved_rate']:.1%}） |"
     )
+    if any(len(r.get("trial_resolved") or []) > 1 for r in results):
+        lines.append(f"| pass@1（trial 成功率） | {summary['pass_at_1']:.1%} |")
+        lines.append(f"| pass^3（3 次全过） | {summary['pass_pow_3']:.1%} |")
     lines.append(
         f"| 有效分母 | {summary['valid']}（排除环境失败 {summary['env_failed']}） |"
     )

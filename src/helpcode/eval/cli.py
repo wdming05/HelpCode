@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--retries", type=int, default=1, help="空补丁时追加提醒重试的次数（默认 1）"
     )
+    run.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="每题采样次数（>1 时报告 pass@1 / pass^3）",
+    )
     run.add_argument("--out", default="runs", help="输出根目录")
     run.add_argument("--run-id", default="", help="运行名（默认时间戳）")
 
@@ -110,6 +116,7 @@ def _run(args) -> int:
         max_turns=args.max_turns,
         timeout=args.timeout,
         retries=args.retries,
+        trials=args.trials,
     )
     asyncio.run(runner.run_all(instances))
     summary = write_report(out_dir, title=f"评测报告 · {run_id}")
@@ -118,6 +125,9 @@ def _run(args) -> int:
     print(
         f"解决率 {summary['resolved']}/{summary['total']} = {summary['resolved_rate']:.1%}"
     )
+    if args.trials > 1:
+        print(f"pass@1（trial 成功率） {summary['pass_at_1']:.1%}")
+        print(f"pass^3（3 次全过） {summary['pass_pow_3']:.1%}")
     if summary["env_failed"]:
         print(
             f"有效分母 {summary['valid']}（排除环境失败 {summary['env_failed']}）"

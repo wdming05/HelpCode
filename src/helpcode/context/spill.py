@@ -19,9 +19,11 @@ from .constants import (
     BATCH_RESULT_MAX,
     PREVIEW_CHARS,
     PREVIEW_LINES,
+    SPILL_BATCH_RATIO,
     SPILL_DIR,
     SPILL_EXEMPT_TOOLS,
     SPILL_MARK,
+    SPILL_SINGLE_RATIO,
     TOOL_RESULT_MAX,
 )
 from .estimate import estimate_tokens
@@ -30,13 +32,28 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def apply(
-    conv: Conversation, root: Path, subdir: Path | None = None
+    conv: Conversation,
+    root: Path,
+    subdir: Path | None = None,
+    effective_window: int | None = None,
 ) -> tuple[int, list[str]]:
     """就地落盘超限的工具结果，返回 (落盘条数, 告警列表)。
+
+    ``effective_window`` 提供时，阈值用「有效窗口比例」自适应不同窗口的模型：
+    单条 ``> effective_window × SPILL_SINGLE_RATIO``、一批 ``> effective_window ×
+    SPILL_BATCH_RATIO``。不提供时回退写死的 ``TOOL_RESULT_MAX``/``BATCH_RESULT_MAX``
+    （兼容既有调用与测试）。
 
     不抛异常：落盘失败（磁盘满 / 只读目录）只是让这一条保持原样并记一条告警，
     因为「超预算」比「对话直接崩掉」轻得多。
     """
+    if effective_window is not None:
+        single_max = int(effective_window * SPILL_SINGLE_RATIO)
+        batch_max = int(effective_window * SPILL_BATCH_RATIO)
+    else:
+        single_max = TOOL_RESULT_MAX
+        batch_max = BATCH_RESULT_MAX
+
     messages = copy.deepcopy(conv.messages())
     call_names = _collect_call_names(messages)
 
@@ -58,7 +75,7 @@ def apply(
         targets = [
             i
             for i in group
-            if sizes[i] > TOOL_RESULT_MAX
+            if sizes[i] > single_max
             and not _already_spilled(messages[i])
             and i not in exempt
         ]
@@ -66,14 +83,14 @@ def apply(
             total -= sizes[i]
 
         # ② 合计仍超限：在其余消息里按大小降序补
-        if total > BATCH_RESULT_MAX:
+        if total > batch_max:
             rest = sorted(
                 (i for i in group if i not in targets and i not in exempt),
                 key=lambda i: sizes[i],
                 reverse=True,
             )
             for i in rest:
-                if total <= BATCH_RESULT_MAX:
+                if total <= batch_max:
                     break
                 if _already_spilled(messages[i]):
                     continue

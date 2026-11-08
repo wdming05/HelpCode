@@ -87,6 +87,8 @@ class BashTool:
                 timeout=effective,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",  # Windows 命令输出可能混 GBK 字节，严格 utf-8 会让 reader 线程崩掉
                 shell=shell,
                 cwd=cwd or None,  # None = 沿用进程工作目录（与改造前一致）
             )

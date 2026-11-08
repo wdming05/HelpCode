@@ -24,6 +24,7 @@ from helpcode.eval.judge import (
     EMPTY_PATCH,
     F2P_FAILED,
     JUDGE_ERROR,
+    OVER_MODIFIED,
     P2P_BROKEN,
     RESOLVED,
     TEST_ONLY,
@@ -162,6 +163,22 @@ def test_judge_error_wins():
     assert v.reason == JUDGE_ERROR
 
 
+def test_judge_no_change_resolved():
+    """无需修改题：patch 为空 + 测试全过 = resolved。"""
+    inst = _inst(no_change=True, fail_to_pass=[])
+    out = _outcome({("test_a.py", "test_p2p"): True})
+    v = judge(inst, out, "")
+    assert v.resolved and v.reason == RESOLVED
+
+
+def test_judge_no_change_over_modified():
+    """无需修改题：模型改了文件 → over_modified，即使测试全绿也判失败。"""
+    inst = _inst(no_change=True, fail_to_pass=[])
+    out = _outcome({("test_a.py", "test_p2p"): True})
+    v = judge(inst, out, "diff --git a/src.py b/src.py\n+++ b/src.py\n")
+    assert not v.resolved and v.reason == OVER_MODIFIED
+
+
 # ---------------------------------------------------------------- 驱动
 
 
@@ -296,6 +313,35 @@ def test_summarize_excludes_env_failures():
     assert s["env_failed"] == 1 and s["valid"] == 2
     assert s["resolved_rate"] == pytest.approx(1 / 3, abs=1e-4)
     assert s["resolved_rate_valid"] == pytest.approx(0.5)
+
+
+def test_summarize_pass_metrics():
+    """pass@1 = 通过 trial / 总 trial；pass^3 = 3 次全过的题占比。"""
+    rows = [
+        {
+            "instance_id": "a",
+            "resolved": True,
+            "reason": "resolved",
+            "trial_resolved": [True, True, True],
+        },
+        {
+            "instance_id": "b",
+            "resolved": True,
+            "reason": "resolved",
+            "trial_resolved": [True, False, False],
+        },
+        {
+            "instance_id": "c",
+            "resolved": False,
+            "reason": "f2p_failed",
+            "trial_resolved": [False, False, False],
+        },
+    ]
+    s = summarize(rows)
+    # 4 个通过 trial / 9 个总 trial
+    assert s["pass_at_1"] == pytest.approx(4 / 9, abs=1e-4)
+    # 只有 a 是 3 次全过
+    assert s["pass_pow_3"] == pytest.approx(1 / 3, abs=1e-4)
 
 
 # ---------------------------------------------------------------- 题集

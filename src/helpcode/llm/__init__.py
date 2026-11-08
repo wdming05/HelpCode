@@ -40,6 +40,7 @@ class Message:
     tool_results: list[ToolResult] = field(
         default_factory=list
     )  # 仅 role=="tool" 时使用
+    id: str | None = None  # 进程内消息标识（L2 死胡同剪裁按 id 指认消息）
 
 
 @dataclass

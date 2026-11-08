@@ -9,7 +9,7 @@ from helpcode.tool.read_file import ReadFileTool
 from helpcode.tool.write_file import WriteFileTool
 
 
-def test_registry_has_six_tools():
+def test_registry_has_eight_tools():
     reg = new_default_registry()
     assert set(reg.names()) == {
         "read_file",
@@ -18,6 +18,8 @@ def test_registry_has_six_tools():
         "bash",
         "glob",
         "grep",
+        "snip",
+        "search_history",
     }
 
 
@@ -30,7 +32,7 @@ def test_registry_get_by_name():
 def test_registry_export():
     reg = new_default_registry()
     exported = reg.export()
-    assert len(exported) == 6
+    assert len(exported) == 8
     for d in exported:
         assert {"name", "description", "parameters"} <= set(d.keys())
 
@@ -38,7 +40,7 @@ def test_registry_export():
 def test_registry_read_only_definitions():
     reg = new_default_registry()
     names = [d["name"] for d in reg.read_only_definitions()]
-    assert names == ["read_file", "glob", "grep"]
+    assert names == ["read_file", "glob", "grep", "search_history"]
 
 
 def test_registry_is_read_only():

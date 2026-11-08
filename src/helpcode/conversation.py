@@ -2,6 +2,7 @@
 
 import copy
 import threading
+import uuid
 from collections.abc import Callable
 
 from .llm import Message, ToolCall
@@ -58,6 +59,8 @@ class Conversation:
         )
 
     def _append(self, msg: Message) -> None:
+        if msg.id is None:
+            msg.id = f"m{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._messages.append(msg)
         if self._on_append is not None:

@@ -34,6 +34,8 @@ class Instance:
     log_parser: str = "pytest"
     # 本地合成题用：题目仓库的相对路径（相对数据集文件所在目录）
     local_repo: str = ""
+    # 「无需修改」题：代码本来就对，agent 不该动。patch 为空 + 测试全过才算 resolved
+    no_change: bool = False
 
     def __post_init__(self) -> None:
         self.instance_id = str(self.instance_id).strip()
@@ -96,6 +98,7 @@ def from_row(row: dict[str, Any], *, base_dir: str = "") -> Instance:
         image_key=str(row.get("image_key") or ""),
         log_parser=str(row.get("log_parser") or "pytest"),
         local_repo=local_repo,
+        no_change=bool(row.get("no_change")),
     )
 
 
@@ -114,4 +117,5 @@ def to_row(inst: Instance) -> dict[str, Any]:
         "image_key": inst.image_key,
         "log_parser": inst.log_parser,
         "local_repo": inst.local_repo,
+        "no_change": inst.no_change,
     }

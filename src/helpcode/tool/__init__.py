@@ -111,13 +111,15 @@ class Registry:
 
 
 def new_default_registry() -> Registry:
-    """注册全部 6 个工具，返回注册中心。"""
+    """注册全部工具，返回注册中心。"""
     # 延迟 import，避免与各工具文件形成循环导入
     from .bash import BashTool
     from .edit_file import EditFileTool
     from .glob_tool import GlobTool
     from .grep_tool import GrepTool
     from .read_file import ReadFileTool
+    from .search_history import SearchHistoryTool
+    from .snip import SnipTool
     from .write_file import WriteFileTool
 
     registry = Registry()
@@ -128,6 +130,8 @@ def new_default_registry() -> Registry:
         BashTool(),
         GlobTool(),
         GrepTool(),
+        SnipTool(),
+        SearchHistoryTool(),
     ):
         registry.register(tool)
     return registry

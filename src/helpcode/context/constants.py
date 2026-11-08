@@ -60,3 +60,23 @@ MIN_SUMMARY_CHARS = 50
 
 # 连续失败这么多次就停止自动压缩（第一层不受影响，它不调 LLM）
 SUMMARY_MAX_FAILURES = 3
+
+# ---------------------------------------------------------------- 有效窗口与水位线
+
+# 有效窗口 = 原始窗口 − BUFFER_TOTAL。防撞墙：给大模型输出与摘要请求自身留空间，
+# 否则在水位线之上再叠输出 token 会直接 400。
+BUFFER_OUTPUT = 13000    # 大模型输出预留（output_tokens + 摘要请求输入）
+BUFFER_ESTIMATE = 10000  # 估算误差吸收带（本地估算宁多不少）
+BUFFER_TAIL = 10000      # 摘要后保留区兜底（避免压完立刻又压）
+BUFFER_TOTAL = BUFFER_OUTPUT + BUFFER_ESTIMATE + BUFFER_TAIL  # 33000
+
+# 渐进水位线（占有效窗口的比例）
+MICRO_WATERMARK = 0.55   # L4 局部微压缩触发线
+HARD_WATERMARK = 0.80    # L5 全局硬摘要触发线
+
+# L1 落盘比例阈值（占有效窗口比例，替代写死 8000/16000）
+SPILL_SINGLE_RATIO = 0.05
+SPILL_BATCH_RATIO = 0.10
+
+# L4 局部微压缩：工具链低于这个 token 数不值得摘要
+MICRO_CHAIN_MIN = 2000
