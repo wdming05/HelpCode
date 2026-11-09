@@ -137,13 +137,14 @@ def test_agent_plain_text():
     assert events[-1].done
 
 
-# C：混合响应丢弃工具
-def test_agent_mixed_drops_tools():
+# C：混合响应执行工具（text 引导语不参与是否结束的判断）
+def test_agent_mixed_runs_tools():
     rounds = [
         [
             StreamEvent(text="我来回答"),
             StreamEvent(done=True, tool_calls=_tool_calls(["c1"])),
-        ]
+        ],
+        [StreamEvent(text="工具已执行"), StreamEvent(done=True)],
     ]
     provider = FakeProvider(rounds)
     registry = Registry()
@@ -151,8 +152,13 @@ def test_agent_mixed_drops_tools():
     agent = _make_agent(provider, registry)
     conv = Conversation()
     events = _collect(agent, "hi", conv, asyncio.Event())
-    assert all(e.tool_end is None for e in events)
-    assert conv.messages()[-1].content == "我来回答"
+
+    # 工具被执行了（tool_start / tool_end 都有），而不是被引导语丢弃
+    assert any(e.tool_start is not None for e in events)
+    assert any(e.tool_end is not None for e in events)
+    # 历史里记的是工具调用（assistant 带 tool_calls），不是引导语文本
+    assert any(m.tool_calls for m in conv.messages())
+    assert events[-1].done
 
 
 # D：并发只读 + 串行副作用

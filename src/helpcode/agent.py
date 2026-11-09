@@ -210,8 +210,8 @@ class Agent:
             if cancel_event.is_set():
                 yield AgentEvent(notice="已取消")
                 self._finish_cancelled(conv)
-                yield AgentEvent(done=True)
                 self.tracer.emit("session_end", {})
+                yield AgentEvent(done=True)
                 return
 
             self.tracer.emit("iteration", {"n": iteration})
@@ -266,8 +266,8 @@ class Agent:
                 )
             if report.cancelled:
                 yield AgentEvent(notice="已取消")
-                yield AgentEvent(done=True)
                 self.tracer.emit("session_end", {})
+                yield AgentEvent(done=True)
                 return
             if report.notice:
                 yield AgentEvent(notice=report.notice)
@@ -319,8 +319,8 @@ class Agent:
                         or emergency_retried
                         or out.get("text")
                     ):
-                        yield ev
                         self.tracer.emit("session_end", {})
+                        yield ev
                         return
 
                     emergency_retried = True
@@ -363,19 +363,21 @@ class Agent:
             tool_calls = out.get("tool_calls")
             usage = out.get("usage")
 
-            # 正常完成：纯文本（无工具），或混合（文本 + 工具）时丢弃工具
-            if not tool_calls or text:
+            # 只有「无工具调用」才算本轮结束；引导语（text）不参与判断。
+            # qwen 等模型习惯在调工具前先说一句引导语（"让我用 X 做…"），
+            # 若因 text 非空就丢弃工具调用，任务会"中断"。
+            if not tool_calls:
                 conv.add_assistant(text)
                 self._maybe_start_note_task(conv)
                 # ch12：自然停止触发 Stop（done 之前；取消/出错路径不走这里）
                 await self._dispatch(HookEvent.STOP, {"messages": len(conv.messages())})
                 if usage is not None:
                     yield AgentEvent(token_usage=usage)
-                yield AgentEvent(done=True)
                 self.tracer.emit("session_end", {})
+                yield AgentEvent(done=True)
                 return
 
-            # 纯工具调用：记历史
+            # 有工具调用：执行工具（引导语不参与是否结束的判断）
             conv.add_assistant_tool_calls(tool_calls)
 
             # 未知工具检测：该轮所有调用都未知 → streak+1，否则清零
@@ -386,8 +388,8 @@ class Agent:
             if unknown_run >= self.MAX_UNKNOWN_RUN:
                 yield AgentEvent(notice="连续请求未知工具，已停止")
                 self._ensure_assistant_tail(conv, "连续请求未知工具，已停止")
-                yield AgentEvent(done=True)
                 self.tracer.emit("session_end", {})
+                yield AgentEvent(done=True)
                 return
 
             # 执行（批次内权限检查 + 并发/串行），结果按原始顺序回灌
@@ -427,8 +429,8 @@ class Agent:
         # 迭代上限
         yield AgentEvent(notice="已达到最大迭代次数")
         self._ensure_assistant_tail(conv, "已达到最大迭代次数")
-        yield AgentEvent(done=True)
         self.tracer.emit("session_end", {})
+        yield AgentEvent(done=True)
 
     async def run_to_completion(
         self,
@@ -516,6 +518,15 @@ class Agent:
             "llm_response",
             {
                 "has_tool_calls": bool(tool_calls),
+                "tool_calls": [
+                    {
+                        "name": tc.name,
+                        "input": clip(
+                            json.dumps(tc.input or {}, ensure_ascii=False)
+                        ),
+                    }
+                    for tc in (tool_calls or [])
+                ],
                 "usage": {
                     "input": usage.input_tokens if usage else 0,
                     "output": usage.output_tokens if usage else 0,
